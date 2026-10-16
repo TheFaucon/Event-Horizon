@@ -1,0 +1,6 @@
+{
+  "name": "Event Horizon: Interactive 3D Black Hole",
+  "description": "Interactive 3D relativistic black hole simulation featuring a procedural particle accretion disk, customizable asteroid belt, dynamic starfield, and real-time physics controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
