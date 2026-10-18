@@ -23,6 +23,12 @@ export interface SimulationConfig {
   bloomStrength: number;        // Glow intensity (0.1 - 3.0)
   bloomThreshold: number;       // Brightness threshold for bloom (0.0 - 1.0)
   
+  // Rigid-Body Physics Engine
+  restitution: number;              // Coefficient of restitution (0.0 = inelastic, 1.0 = super bouncy)
+  fragmentationThreshold: number;   // Kinetic energy threshold to shatter bodies (5 - 120)
+  timeScale: number;                // Physics simulation speed (0.1x slow-mo to 2.5x fast forward)
+  gravitationalPerturbations: boolean; // N-body gravity from massive bodies
+
   // Camera & System
   autoRotateCamera: boolean;    // Cinematic slow camera orbit
   isPaused: boolean;            // Pause physics time
@@ -37,7 +43,7 @@ export const DEFAULT_CONFIG: SimulationConfig = {
   dopplerBeaming: true,
   relativisticJets: true,
   
-  asteroidCount: 650,
+  asteroidCount: 500,
   asteroidBeltRadius: 46,
   asteroidBeltWidth: 12,
   asteroidSpeed: 0.7,
@@ -46,6 +52,11 @@ export const DEFAULT_CONFIG: SimulationConfig = {
   bloomStrength: 1.35,
   bloomThreshold: 0.22,
   
+  restitution: 0.65,
+  fragmentationThreshold: 38.0,
+  timeScale: 1.0,
+  gravitationalPerturbations: true,
+
   autoRotateCamera: false,
   isPaused: false,
   audioEnabled: false,

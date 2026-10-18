@@ -16,8 +16,14 @@ import {
   computeGravitationalAcceleration,
   computeStableOrbitalVelocity,
   stepNewtonianBody,
+  SpatialHashGrid3D,
+  resolveRigidBodyCollision,
+  shatterRigidBody,
+  computeNBodyPerturbations,
+  integrateRigidBodyVerlet,
   COLOR_PALETTES,
 } from './physics.ts';
+import type { RigidBody } from './physics.ts';
 
 test('calculateKeplerianAngularVelocity decreases with radius (differential rotation)', () => {
   const innerOmega = calculateKeplerianAngularVelocity(4.0, 100);
@@ -117,4 +123,224 @@ test('stepNewtonianBody maintains stable orbit at 1g and spirals inward under +2
   const step2g = stepNewtonianBody(r, 0, 0, vx, vy, vz, 1000, 0.05);
   // Under 2x gravity, the inward acceleration is stronger, so velocity vector pulls inward
   assert.ok(step2g.vel[0] < step1g.vel[0], 'Surge gravity should accelerate body inward');
+});
+
+test('SpatialHashGrid3D inserts and indexes bodies for fast 3D neighbor lookup', () => {
+  const grid = new SpatialHashGrid3D(10.0);
+  grid.insert(0, 5, 5, 5);
+  grid.insert(1, 8, 5, 5); // Nearby
+  grid.insert(2, 50, 50, 50); // Far away
+
+  const candidatesNear = grid.queryCandidates(5, 5, 5, 4.0);
+  assert.ok(candidatesNear.includes(0), 'Should find body 0');
+  assert.ok(candidatesNear.includes(1), 'Should find body 1');
+  assert.ok(!candidatesNear.includes(2), 'Should not find distant body 2');
+});
+
+test('resolveRigidBodyCollision conserves total linear momentum during 3D impact', () => {
+  const bodyA: RigidBody = {
+    id: 1,
+    type: 'asteroid',
+    x: 0,
+    y: 0,
+    z: 0,
+    vx: 10,
+    vy: 0,
+    vz: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+    mass: 2.0,
+    radius: 1.0,
+    restitution: 0.8,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0,
+    angVy: 0,
+    angVz: 0,
+    inertia: 0.4 * 2.0 * 1.0,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  const bodyB: RigidBody = {
+    id: 2,
+    type: 'asteroid',
+    x: 1.5, // Overlapping by 0.5 units
+    y: 0,
+    z: 0,
+    vx: -5,
+    vy: 0,
+    vz: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+    mass: 3.0,
+    radius: 1.0,
+    restitution: 0.8,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0,
+    angVy: 0,
+    angVz: 0,
+    inertia: 0.4 * 3.0 * 1.0,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  const initialMomentumX = bodyA.mass * bodyA.vx + bodyB.mass * bodyB.vx; // 2 * 10 + 3 * (-5) = 5.0
+  const result = resolveRigidBodyCollision(bodyA, bodyB, 0.8, 100.0);
+
+  assert.ok(result.collided, 'Collision should be detected');
+  assert.ok(result.normalImpulse > 0, 'Normal impulse must be positive');
+
+  // Verify total momentum conservation
+  const finalMomentumX = bodyA.mass * bodyA.vx + bodyB.mass * bodyB.vx;
+  assert.ok(Math.abs(finalMomentumX - initialMomentumX) < 0.001, `Momentum conserved: before=${initialMomentumX}, after=${finalMomentumX}`);
+
+  // Verify separation
+  const postDist = Math.sqrt((bodyB.x - bodyA.x) ** 2 + (bodyB.y - bodyA.y) ** 2 + (bodyB.z - bodyA.z) ** 2);
+  assert.ok(postDist > 1.5, 'Positional penetration must be resolved');
+});
+
+test('shatterRigidBody conserves total mass and produces debris chunks', () => {
+  const parent: RigidBody = {
+    id: 99,
+    type: 'asteroid',
+    x: 10,
+    y: 0,
+    z: 0,
+    vx: 5,
+    vy: 1,
+    vz: -2,
+    ax: 0,
+    ay: 0,
+    az: 0,
+    mass: 12.0,
+    radius: 1.5,
+    restitution: 0.5,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0,
+    angVy: 0,
+    angVz: 0,
+    inertia: 0.4 * 12 * 1.5 * 1.5,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  let idCounter = 1000;
+  const chunks = shatterRigidBody(parent, [1, 0, 0], () => idCounter++, 4);
+
+  assert.equal(parent.isAlive, false, 'Parent must be deactivated');
+  assert.equal(chunks.length, 4, 'Must create 4 debris chunks');
+
+  // Total mass conservation
+  const sumMass = chunks.reduce((acc, c) => acc + c.mass, 0);
+  assert.ok(Math.abs(sumMass - parent.mass) < 0.001, 'Sum of chunk masses must equal parent mass');
+
+  // Generations must be incremented
+  assert.equal(chunks[0].generation, 1);
+  assert.equal(chunks[0].type, 'debris');
+});
+
+test('computeNBodyPerturbations accelerates test body towards massive planetoid', () => {
+  const target: RigidBody = {
+    id: 1,
+    type: 'asteroid',
+    x: 10,
+    y: 0,
+    z: 0,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+    mass: 1.0,
+    radius: 0.5,
+    restitution: 0.5,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0,
+    angVy: 0,
+    angVz: 0,
+    inertia: 0.1,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  const planetoid: RigidBody = {
+    id: 999,
+    type: 'planetoid',
+    x: 20, // To the right (+X)
+    y: 0,
+    z: 0,
+    vx: 0,
+    vy: 0,
+    vz: 0,
+    ax: 0,
+    ay: 0,
+    az: 0,
+    mass: 200.0, // Massive!
+    radius: 3.0,
+    restitution: 0.5,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0,
+    angVy: 0,
+    angVz: 0,
+    inertia: 50.0,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  const [pax, pay, paz] = computeNBodyPerturbations(target, [planetoid], 1.0);
+  assert.ok(pax > 0, 'Planetoid at +X must pull target towards +X');
+  assert.ok(Math.abs(pay) < 1e-9);
+  assert.ok(Math.abs(paz) < 1e-9);
+});
+
+test('integrateRigidBodyVerlet updates position and angular orientation', () => {
+  const body: RigidBody = {
+    id: 1,
+    type: 'asteroid',
+    x: 0,
+    y: 0,
+    z: 0,
+    vx: 2,
+    vy: 0,
+    vz: 0,
+    ax: 1,
+    ay: 0,
+    az: 0,
+    mass: 1.0,
+    radius: 1.0,
+    restitution: 0.5,
+    rotX: 0,
+    rotY: 0,
+    rotZ: 0,
+    angVx: 0.5,
+    angVy: 0,
+    angVz: 0,
+    inertia: 0.4,
+    isAlive: true,
+    spaghettifying: false,
+    generation: 0,
+  };
+
+  integrateRigidBodyVerlet(body, 0.1);
+  assert.ok(body.vx > 2.0, 'Velocity must increase with acceleration');
+  assert.ok(body.x > 0.2, 'Position must advance with velocity');
+  assert.ok(body.rotX > 0, 'Orientation must advance with angular spin');
 });

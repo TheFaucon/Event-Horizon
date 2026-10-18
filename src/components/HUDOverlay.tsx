@@ -18,6 +18,9 @@ import {
   Orbit,
   Flame,
   Info,
+  Zap,
+  Activity,
+  Globe2,
 } from 'lucide-react';
 import { CameraPreset, SimulationConfig } from '../types/simulation';
 import { COLOR_PALETTES, SimulationEvent } from '../utils/physics';
@@ -29,14 +32,20 @@ interface HUDOverlayProps {
   onSelectCameraPreset: (preset: CameraPreset) => void;
   onLaunchProbe: () => void;
   onRespawnBelt: () => void;
+  onSpawnPlanetoid: () => void;
+  onOpenCelestialModal: () => void;
+  celestialBodiesCount: number;
+  onQuickSpawnCelestial: (presetId: string) => void;
   events: SimulationEvent[];
   onClearEvents: () => void;
   probesDevouredCount: number;
   fps: number;
   activeParticles: number;
+  activeBodies: number;
+  totalCollisions: number;
 }
 
-type TabType = 'accretion' | 'asteroids' | 'palette_bloom' | 'camera_system';
+type TabType = 'accretion' | 'rigid_physics' | 'celestial_fleet' | 'palette_bloom' | 'camera_system';
 
 export const HUDOverlay: React.FC<HUDOverlayProps> = ({
   config,
@@ -44,17 +53,23 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
   onSelectCameraPreset,
   onLaunchProbe,
   onRespawnBelt,
+  onSpawnPlanetoid,
+  onOpenCelestialModal,
+  celestialBodiesCount,
+  onQuickSpawnCelestial,
   events,
   onClearEvents,
   probesDevouredCount,
   fps,
   activeParticles,
+  activeBodies,
+  totalCollisions,
 }) => {
   const [activeTab, setActiveTab] = useState<TabType>('accretion');
   const [isCollapsed, setIsCollapsed] = useState<boolean>(false);
   const [showInfoModal, setShowInfoModal] = useState<boolean>(false);
 
-  // Keyboard shortcut: 'H' toggles dock, 'Space' launches probe, 'R' respawns belt
+  // Keyboard shortcut: 'H' toggles dock, 'Space' launches probe, 'R' respawns belt, 'P' spawns planetoid
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -66,44 +81,54 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
         onLaunchProbe();
       } else if (e.key === 'r' || e.key === 'R') {
         onRespawnBelt();
+      } else if (e.key === 'p' || e.key === 'P') {
+        onSpawnPlanetoid();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onLaunchProbe, onRespawnBelt]);
+  }, [onLaunchProbe, onRespawnBelt, onSpawnPlanetoid]);
 
   const activePalette = COLOR_PALETTES[config.colorPaletteId] || COLOR_PALETTES.gargantua;
-
-  // Most recent event for instant visual feedback ticker
   const latestEvent = events.length > 0 ? events[0] : null;
 
   return (
     <div className="absolute inset-0 pointer-events-none flex flex-col justify-between p-3 sm:p-4 z-10 font-sans">
       {/* Top Header Bar: Telemetry, Event Log & Actions */}
-      <header className="flex items-center justify-between w-full pointer-events-auto gap-2">
-        <div className="flex items-center space-x-3 bg-neutral-950/90 border border-neutral-800 rounded-lg px-3.5 py-2 text-white shadow-xl">
-          <div className="w-3 h-3 rounded-full bg-amber-500" />
+      <header className="flex flex-wrap sm:flex-nowrap items-center justify-between w-full pointer-events-auto gap-2">
+        <div className="flex items-center space-x-2.5 bg-neutral-950/90 border border-neutral-800 rounded-lg px-3 py-1.5 sm:px-3.5 sm:py-2 text-white shadow-xl">
+          <div className="w-2.5 h-2.5 sm:w-3 sm:h-3 rounded-full bg-amber-500 shrink-0" />
           <div>
-            <h1 className="text-sm font-semibold tracking-wider uppercase text-neutral-200">
+            <h1 className="text-xs sm:text-sm font-semibold tracking-wider uppercase text-neutral-200">
               Event Horizon 3D
             </h1>
-            <p className="text-xs text-neutral-400 font-mono">
-              Relativistic Kerr Black Hole • M = 4.3×10^6 M_sun
+            <p className="hidden sm:block text-xs text-neutral-400 font-mono">
+              3D Rigid-Body Physics • M = 4.3×10^6 M_sun
             </p>
           </div>
         </div>
 
         {/* Real-Time Telemetry Badges */}
-        <div className="hidden md:flex items-center space-x-2">
+        <div className="hidden lg:flex items-center space-x-2">
           <div className="bg-neutral-950/90 border border-neutral-800 px-3 py-1.5 rounded-lg text-xs font-mono text-neutral-300">
             <span className="text-neutral-500 mr-1.5">FPS</span>
             <span className={fps < 30 ? 'text-amber-400 font-bold' : 'text-emerald-400 font-bold'}>{fps}</span>
           </div>
 
           <div className="bg-neutral-950/90 border border-neutral-800 px-3 py-1.5 rounded-lg text-xs font-mono text-neutral-300">
-            <span className="text-neutral-500 mr-1.5">Particles</span>
-            <span className="text-cyan-400 font-bold">{activeParticles.toLocaleString()}</span>
+            <span className="text-neutral-500 mr-1.5">Bodies</span>
+            <span className="text-cyan-400 font-bold">{activeBodies}</span>
+          </div>
+
+          <div className="bg-neutral-950/90 border border-neutral-800 px-3 py-1.5 rounded-lg text-xs font-mono text-neutral-300">
+            <span className="text-neutral-500 mr-1.5">Planets</span>
+            <span className="text-indigo-400 font-bold">{celestialBodiesCount}</span>
+          </div>
+
+          <div className="bg-neutral-950/90 border border-neutral-800 px-3 py-1.5 rounded-lg text-xs font-mono text-neutral-300">
+            <span className="text-neutral-500 mr-1.5">Collisions</span>
+            <span className="text-rose-400 font-bold">{totalCollisions}</span>
           </div>
 
           <div className="bg-neutral-950/90 border border-neutral-800 px-3 py-1.5 rounded-lg text-xs font-mono text-neutral-300">
@@ -114,27 +139,44 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           <button
             type="button"
             onClick={() => setShowInfoModal(true)}
-            aria-label="Astrophysics information"
+            aria-label="Astrophysics & Physics information"
             className="bg-neutral-950/90 hover:bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white p-2 rounded-lg transition-colors cursor-pointer"
           >
             <Info className="w-4 h-4" />
           </button>
         </div>
 
-        {/* Top Right: Event Log, Respawn Belt, & Probe Launcher */}
-        <div className="flex items-center space-x-2">
-          {/* Event Log Component */}
+        {/* Top Right Actions: Event Log, Spawn Planetoid & Probe Launcher */}
+        <div className="flex flex-wrap items-center gap-1.5 sm:space-x-2">
           <EventLog events={events} onClearEvents={onClearEvents} />
 
-          {/* Quick Respawn Belt Button */}
+          {/* Celestial Bodies Creator Button */}
           <button
             type="button"
-            onClick={onRespawnBelt}
-            title="Reset & Respawn Asteroid Belt (R)"
-            className="hidden sm:flex items-center space-x-1.5 bg-neutral-950/90 hover:bg-neutral-900 border border-neutral-800 text-neutral-300 hover:text-white text-xs px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+            onClick={onOpenCelestialModal}
+            title="Ajouter des corps célestes en orbite (Planètes, Anneaux, Lunes, Comètes)"
+            className="flex items-center space-x-1.5 bg-gradient-to-r from-blue-700 via-indigo-600 to-violet-600 hover:from-blue-600 hover:to-violet-500 text-white text-xs font-medium uppercase tracking-wide px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-lg shadow-lg cursor-pointer transition-all active:scale-95 border border-indigo-400/40"
           >
-            <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Respawn Belt</span>
+            <Orbit className="w-3.5 h-3.5 text-indigo-200" />
+            <span className="hidden sm:inline">+ Corps Célestes</span>
+            <span className="sm:hidden">+ Planète</span>
+            {celestialBodiesCount > 0 && (
+              <span className="bg-indigo-300/30 text-indigo-100 text-[10px] px-1.5 py-0.2 rounded-full font-bold ml-0.5">
+                {celestialBodiesCount}
+              </span>
+            )}
+          </button>
+
+          {/* Rogue Planetoid Spawn Button */}
+          <button
+            type="button"
+            onClick={onSpawnPlanetoid}
+            title="Spawn Massive Rogue Planetoid (P)"
+            className="flex items-center space-x-1.5 bg-gradient-to-r from-rose-700 to-red-600 hover:from-rose-600 hover:to-red-500 text-white text-xs font-medium uppercase tracking-wide px-2.5 sm:px-3 py-1.5 sm:py-2 rounded-lg shadow-lg cursor-pointer transition-all active:scale-95 border border-red-400/30"
+          >
+            <Globe2 className="w-3.5 h-3.5 text-rose-200" />
+            <span className="hidden sm:inline">Rogue Planetoid <span className="opacity-60 text-[10px] lowercase">(p)</span></span>
+            <span className="sm:hidden">Planetoid</span>
           </button>
 
           {/* Quick Matter Launcher Button */}
@@ -144,15 +186,16 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
             className="flex items-center space-x-1.5 sm:space-x-2 bg-gradient-to-r from-amber-600 to-orange-600 hover:from-amber-500 hover:to-orange-500 text-white text-xs font-medium uppercase tracking-wide px-2.5 sm:px-3.5 py-1.5 sm:py-2 rounded-lg shadow-lg cursor-pointer transition-all active:scale-95 border border-amber-400/30"
           >
             <Flame className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-200" />
-            <span>Launch Probe <span className="hidden sm:inline opacity-60 text-[10px] lowercase">(space)</span></span>
+            <span className="hidden sm:inline">Launch Probe <span className="opacity-60 text-[10px] lowercase">(space)</span></span>
+            <span className="sm:hidden">Probe</span>
           </button>
         </div>
       </header>
 
-      {/* Floating Alert Ticker (Shows the latest horizon crossing event) */}
+      {/* Floating Alert Ticker */}
       {latestEvent && (
         <div className="pointer-events-none self-center transition-all duration-300 my-2">
-          <div className="bg-neutral-950/85 border border-amber-500/30 rounded-full px-4 py-1 text-[11px] font-mono text-neutral-200 flex items-center space-x-2 shadow-2xl backdrop-blur-none">
+          <div className="bg-neutral-950/85 border border-amber-500/30 rounded-full px-4 py-1 text-[11px] font-mono text-neutral-200 flex items-center space-x-2 shadow-2xl">
             <span className="w-2 h-2 rounded-full bg-amber-400" />
             <span className="text-amber-300 uppercase font-semibold">{latestEvent.title}:</span>
             <span className="text-neutral-300">{latestEvent.details}</span>
@@ -160,11 +203,8 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
         </div>
       )}
 
-      {/* Central Viewport is completely unobstructed for maximum 3D clarity */}
-
       {/* Unified Bottom Control Dock */}
       <footer className="w-full flex flex-col items-center pointer-events-auto">
-        {/* Toggle Collapse Pill */}
         <button
           type="button"
           onClick={() => setIsCollapsed((prev) => !prev)}
@@ -184,7 +224,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           )}
         </button>
 
-        {/* Main Dock Container */}
         <div
           className={`w-full max-w-4xl bg-neutral-950/95 border border-neutral-800 rounded-2xl p-3 sm:p-4 shadow-2xl transition-all duration-300 ${
             isCollapsed ? 'translate-y-full opacity-0 pointer-events-none h-0 p-0 overflow-hidden border-0' : 'translate-y-0 opacity-100'
@@ -209,16 +248,35 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
 
               <button
                 type="button"
-                onClick={() => setActiveTab('asteroids')}
+                onClick={() => setActiveTab('rigid_physics')}
                 className={`flex items-center space-x-1 sm:space-x-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
-                  activeTab === 'asteroids'
+                  activeTab === 'rigid_physics'
                     ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
                     : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900'
                 }`}
               >
-                <Orbit className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">Asteroid Belt</span>
-                <span className="sm:hidden">Asteroids</span>
+                <Zap className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">3D Rigid Physics</span>
+                <span className="sm:hidden">Physics</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setActiveTab('celestial_fleet')}
+                className={`flex items-center space-x-1 sm:space-x-1.5 px-2.5 sm:px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors cursor-pointer ${
+                  activeTab === 'celestial_fleet'
+                    ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/40'
+                    : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-900'
+                }`}
+              >
+                <Globe2 className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Corps Célestes</span>
+                <span className="sm:hidden">Planètes</span>
+                {celestialBodiesCount > 0 && (
+                  <span className="bg-indigo-500/30 text-indigo-200 text-[10px] px-1.5 py-0.2 rounded-full font-bold ml-1">
+                    {celestialBodiesCount}
+                  </span>
+                )}
               </button>
 
               <button
@@ -250,7 +308,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
               </button>
             </div>
 
-            {/* Quick Play/Pause and Audio Controls */}
+            {/* Play/Pause & Audio */}
             <div className="flex items-center space-x-1.5">
               <button
                 type="button"
@@ -279,7 +337,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           {/* TAB 1: ACCRETION DISK & GRAVITY */}
           {activeTab === 'accretion' && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-neutral-300">
-              {/* Gravity Inward Pull */}
               <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <div className="flex justify-between items-center">
                   <label htmlFor="gravity-pull" className="font-medium text-neutral-200">
@@ -311,7 +368,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
                 </p>
               </div>
 
-              {/* Rotation Speed */}
               <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <div className="flex justify-between items-center">
                   <label htmlFor="rotation-speed" className="font-medium text-neutral-200">
@@ -337,7 +393,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
                 </p>
               </div>
 
-              {/* Particle Density & Toggles */}
               <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <div className="flex justify-between items-center">
                   <label htmlFor="particle-density" className="font-medium text-neutral-200">
@@ -383,97 +438,247 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
             </div>
           )}
 
-          {/* TAB 2: ASTEROID BELT */}
-          {activeTab === 'asteroids' && (
+          {/* TAB 2: TRUE 3D RIGID PHYSICS & COLLISIONS */}
+          {activeTab === 'rigid_physics' && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-neutral-300">
-              {/* Asteroid Population & Respawn */}
+              {/* Physics Properties: Restitution & Fragmentation */}
               <div className="flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <div className="flex justify-between items-center">
-                  <label htmlFor="asteroid-count" className="font-medium text-neutral-200">
-                    Asteroid Population
+                  <label htmlFor="restitution" className="font-medium text-neutral-200">
+                    Restitution (Bounciness)
                   </label>
-                  <span className="font-mono text-cyan-400">{config.asteroidCount} rocks</span>
+                  <span className="font-mono text-cyan-400">e = {config.restitution.toFixed(2)}</span>
                 </div>
                 <input
-                  id="asteroid-count"
+                  id="restitution"
                   type="range"
-                  min="100"
-                  max="1200"
-                  step="50"
-                  value={config.asteroidCount}
+                  min="0.0"
+                  max="0.95"
+                  step="0.05"
+                  value={config.restitution}
                   onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    onChangeConfig((c) => ({ ...c, asteroidCount: val }));
+                    const val = parseFloat(e.target.value);
+                    onChangeConfig((c) => ({ ...c, restitution: val }));
                   }}
                   className="w-full accent-cyan-500 cursor-pointer h-1.5 bg-neutral-700 rounded-lg"
                 />
-                {/* Reset / Respawn Belt Button */}
+
+                <div className="flex justify-between items-center pt-1">
+                  <label htmlFor="fragmentation-threshold" className="font-medium text-neutral-200">
+                    Destruction / Shatter Threshold
+                  </label>
+                  <span className="font-mono text-rose-400">{config.fragmentationThreshold.toFixed(0)} J</span>
+                </div>
+                <input
+                  id="fragmentation-threshold"
+                  type="range"
+                  min="8.0"
+                  max="90.0"
+                  step="2.0"
+                  value={config.fragmentationThreshold}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    onChangeConfig((c) => ({ ...c, fragmentationThreshold: val }));
+                  }}
+                  className="w-full accent-rose-500 cursor-pointer h-1.5 bg-neutral-700 rounded-lg"
+                />
+                <p className="text-[11px] text-neutral-400">
+                  Collisions exceeding threshold shatter bodies into 3–5 physical debris chunks.
+                </p>
+              </div>
+
+              {/* Integrator Time Scale & N-Body Gravity */}
+              <div className="flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
+                <div className="flex justify-between items-center">
+                  <label htmlFor="time-scale" className="font-medium text-neutral-200">
+                    Simulation Time Scale
+                  </label>
+                  <span className="font-mono text-amber-400">{config.timeScale.toFixed(2)}x</span>
+                </div>
+                <input
+                  id="time-scale"
+                  type="range"
+                  min="0.1"
+                  max="2.5"
+                  step="0.05"
+                  value={config.timeScale}
+                  onChange={(e) => {
+                    const val = parseFloat(e.target.value);
+                    onChangeConfig((c) => ({ ...c, timeScale: val }));
+                  }}
+                  className="w-full accent-amber-500 cursor-pointer h-1.5 bg-neutral-700 rounded-lg"
+                />
+
+                <div className="pt-1">
+                  <label className="flex items-center space-x-1.5 cursor-pointer text-neutral-200 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={config.gravitationalPerturbations}
+                      onChange={(e) => onChangeConfig((c) => ({ ...c, gravitationalPerturbations: e.target.checked }))}
+                      className="rounded accent-cyan-500"
+                    />
+                    <span>N-Body Gravitational Perturbations</span>
+                  </label>
+                  <p className="text-[11px] text-neutral-400 pt-0.5">
+                    Massive bodies (such as the Rogue Planetoid) exert mutual gravity on surrounding asteroids.
+                  </p>
+                </div>
+              </div>
+
+              {/* Action Triggers: Rogue Planetoid & Respawn Belt */}
+              <div className="flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
+                <span className="font-medium text-neutral-200">Orbital Chaos Tests</span>
+                <button
+                  type="button"
+                  onClick={onSpawnPlanetoid}
+                  className="flex items-center justify-center space-x-2 bg-gradient-to-r from-rose-900 to-red-700 hover:from-rose-800 hover:to-red-600 border border-red-500/40 text-white py-1.5 px-3 rounded-lg font-medium transition-all cursor-pointer shadow-md active:scale-95 text-xs"
+                >
+                  <Globe2 className="w-3.5 h-3.5 text-rose-300" />
+                  <span>Spawn Rogue Planetoid (P)</span>
+                </button>
+
                 <button
                   type="button"
                   onClick={onRespawnBelt}
-                  className="flex items-center justify-center space-x-2 bg-cyan-950/80 hover:bg-cyan-900 border border-cyan-800/60 text-cyan-200 py-1.5 px-3 rounded-lg font-medium transition-colors cursor-pointer mt-1"
+                  className="flex items-center justify-center space-x-2 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-200 py-1.5 px-3 rounded-lg font-medium transition-colors cursor-pointer text-xs"
                 >
                   <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
                   <span>Reset / Respawn Belt (R)</span>
                 </button>
-              </div>
 
-              {/* Belt Radius */}
-              <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
-                <div className="flex justify-between items-center">
-                  <label htmlFor="asteroid-radius" className="font-medium text-neutral-200">
-                    Belt Orbital Radius
-                  </label>
-                  <span className="font-mono text-emerald-400">{config.asteroidBeltRadius} AU</span>
+                <div className="flex justify-between items-center text-[10px] text-neutral-400 pt-0.5">
+                  <span>3D Spatial Hash Grid O(N)</span>
+                  <span>Verlet Symplectic</span>
                 </div>
-                <input
-                  id="asteroid-radius"
-                  type="range"
-                  min="36"
-                  max="68"
-                  step="2"
-                  value={config.asteroidBeltRadius}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    onChangeConfig((c) => ({ ...c, asteroidBeltRadius: val }));
-                  }}
-                  className="w-full accent-emerald-500 cursor-pointer h-1.5 bg-neutral-700 rounded-lg"
-                />
-                <p className="text-[11px] text-neutral-400">
-                  Initial distance where asteroids are seeded at circular orbital speed v = √(GM/r).
-                </p>
               </div>
+            </div>
+          )}
 
-              {/* Belt Width & Navigation */}
-              <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
-                <div className="flex justify-between items-center">
-                  <label htmlFor="asteroid-width" className="font-medium text-neutral-200">
-                    Belt Radial Width
-                  </label>
-                  <span className="font-mono text-blue-400">{config.asteroidBeltWidth} AU</span>
-                </div>
-                <input
-                  id="asteroid-width"
-                  type="range"
-                  min="4"
-                  max="20"
-                  step="1"
-                  value={config.asteroidBeltWidth}
-                  onChange={(e) => {
-                    const val = parseInt(e.target.value, 10);
-                    onChangeConfig((c) => ({ ...c, asteroidBeltWidth: val }));
-                  }}
-                  className="w-full accent-blue-500 cursor-pointer h-1.5 bg-neutral-700 rounded-lg"
-                />
-                <div className="flex justify-between items-center pt-1 text-[11px] text-neutral-400">
-                  <span>Newtonian 3D N-body</span>
+          {/* TAB: CELESTIAL FLEET / CORPS CÉLESTES */}
+          {activeTab === 'celestial_fleet' && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-neutral-300">
+              {/* Quick Spawn Buttons */}
+              <div className="flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
+                <span className="font-medium text-neutral-200">Préréglages d&apos;insertion orbitale</span>
+                <div className="grid grid-cols-2 gap-1.5">
                   <button
                     type="button"
-                    onClick={() => onSelectCameraPreset('asteroid_belt')}
-                    className="text-cyan-400 hover:underline cursor-pointer"
+                    onClick={() => onQuickSpawnCelestial('preset-gaia')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-blue-950/70 border border-neutral-700/60 hover:border-blue-500/50 text-left transition-all cursor-pointer text-[11px]"
                   >
-                    Jump to Belt POV →
+                    <span className="text-base">🌍</span>
+                    <div>
+                      <div className="font-semibold text-white">Gaia Prime</div>
+                      <div className="text-[9px] text-neutral-400">Terre + 1 Lune</div>
+                    </div>
                   </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onQuickSpawnCelestial('preset-chronos')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-amber-950/70 border border-neutral-700/60 hover:border-amber-500/50 text-left transition-all cursor-pointer text-[11px]"
+                  >
+                    <span className="text-base">🪐</span>
+                    <div>
+                      <div className="font-semibold text-white">Chronos-9</div>
+                      <div className="text-[9px] text-neutral-400">Anneaux + 2 Lunes</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onQuickSpawnCelestial('preset-infernus')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-rose-950/70 border border-neutral-700/60 hover:border-rose-500/50 text-left transition-all cursor-pointer text-[11px]"
+                  >
+                    <span className="text-base">🌋</span>
+                    <div>
+                      <div className="font-semibold text-white">Infernus</div>
+                      <div className="text-[9px] text-neutral-400">Super-Terre Lave</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onQuickSpawnCelestial('preset-thalassa')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-sky-950/70 border border-neutral-700/60 hover:border-sky-500/50 text-left transition-all cursor-pointer text-[11px]"
+                  >
+                    <span className="text-base">🌊</span>
+                    <div>
+                      <div className="font-semibold text-white">Thalassa</div>
+                      <div className="text-[9px] text-neutral-400">Océan + 1 Lune</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onQuickSpawnCelestial('preset-borealis')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-cyan-950/70 border border-neutral-700/60 hover:border-cyan-500/50 text-left transition-all cursor-pointer text-[11px]"
+                  >
+                    <span className="text-base">🌕</span>
+                    <div>
+                      <div className="font-semibold text-white">Boréalis</div>
+                      <div className="text-[9px] text-neutral-400">Planète Naine Glacée</div>
+                    </div>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => onQuickSpawnCelestial('preset-neowise')}
+                    className="flex items-center space-x-1.5 p-2 rounded-lg bg-neutral-800/90 hover:bg-indigo-950/70 border border-neutral-700/60 hover:border-indigo-500/50 text-left transition-all cursor-pointer text-[11px]"
+                  >
+                    <span className="text-base">☄️</span>
+                    <div>
+                      <div className="font-semibold text-white">Néowise-X</div>
+                      <div className="text-[9px] text-neutral-400">Comète Excentrique</div>
+                    </div>
+                  </button>
+                </div>
+              </div>
+
+              {/* Creator & Modal Launcher */}
+              <div className="flex flex-col justify-between space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <span className="font-medium text-neutral-200">Créateur de Corps Personnalisé</span>
+                    <span className="text-[10px] text-indigo-400 font-mono">Sur-Mesure</span>
+                  </div>
+                  <p className="text-[11px] text-neutral-400 leading-relaxed">
+                    Créez un objet céleste unique : configurez son rayon, sa masse, ses anneaux, ses lunes en orbite (jusqu&apos;à 4 lunes), et son inclinaison.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={onOpenCelestialModal}
+                  className="w-full flex items-center justify-center space-x-2 py-2 px-3 rounded-lg bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white font-medium shadow-md transition-all cursor-pointer active:scale-98"
+                >
+                  <Orbit className="w-3.5 h-3.5" />
+                  <span>Ouvrir l&apos;Atelier Céleste</span>
+                </button>
+              </div>
+
+              {/* Orbit Status & Physics Info */}
+              <div className="flex flex-col justify-between space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
+                <div>
+                  <span className="font-medium text-neutral-200">Dynamique Gravitationnelle</span>
+                  <div className="text-[11px] text-neutral-400 space-y-1 pt-1">
+                    <div className="flex justify-between">
+                      <span>Corps actifs:</span>
+                      <span className="font-mono text-indigo-400 font-bold">{celestialBodiesCount} en orbite</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Lois physiques:</span>
+                      <span className="font-mono text-neutral-300">Kepler & Newton</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Effet de marée:</span>
+                      <span className="font-mono text-amber-400">Spaghettification</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="p-2 rounded-lg bg-neutral-950/80 border border-neutral-800 text-[10px] text-neutral-400">
+                  Augmentez le curseur <b>Gravity Pull</b> dans l&apos;onglet Accrétion pour déclencher le déclin orbital des planètes vers le trou noir !
                 </div>
               </div>
             </div>
@@ -482,7 +687,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           {/* TAB 3: COLOR PALETTE & BLOOM GLOW */}
           {activeTab === 'palette_bloom' && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-neutral-300">
-              {/* Palette Preset Selector */}
               <div className="md:col-span-2 flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <span className="font-medium text-neutral-200">Accretion Color Palette</span>
                 <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
@@ -515,7 +719,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
                 </p>
               </div>
 
-              {/* UnrealBloom Post-Processing Glow */}
               <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <div className="flex justify-between items-center">
                   <label htmlFor="bloom-strength" className="font-medium text-neutral-200">
@@ -556,7 +759,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
           {/* TAB 4: CAMERA PRESETS & AUDIO SYSTEM */}
           {activeTab === 'camera_system' && (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs text-neutral-300">
-              {/* Camera Presets */}
               <div className="md:col-span-2 flex flex-col space-y-2 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <span className="font-medium text-neutral-200">Camera Viewpoints</span>
                 <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
@@ -610,7 +812,6 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
                 </div>
               </div>
 
-              {/* Space Soundscape */}
               <div className="flex flex-col space-y-1.5 bg-neutral-900/60 p-2.5 rounded-xl border border-neutral-800/80">
                 <span className="font-medium text-neutral-200">Space Soundscape</span>
                 <button
@@ -634,7 +835,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
         </div>
       </footer>
 
-      {/* Educational Astrophysics Modal */}
+      {/* Educational Astrophysics & Physics Modal */}
       {showInfoModal && (
         <div
           role="dialog"
@@ -645,7 +846,7 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
             <div className="flex items-center justify-between border-b border-neutral-800 pb-3 mb-4">
               <h2 className="text-base font-semibold text-white flex items-center space-x-2">
                 <Disc className="w-4 h-4 text-amber-400" />
-                <span>Anatomy of a Relativistic Black Hole</span>
+                <span>3D Rigid-Body Physics & Astrophysics Engine</span>
               </h2>
               <button
                 type="button"
@@ -659,24 +860,20 @@ export const HUDOverlay: React.FC<HUDOverlayProps> = ({
 
             <div className="space-y-3 text-xs leading-relaxed text-neutral-300 max-h-[60vh] overflow-y-auto pr-2">
               <div>
-                <strong className="text-amber-400 block text-sm mb-0.5">1. Event Horizon & ISCO</strong>
-                The boundary from which not even light can escape (Rs = 2GM/c²). Surrounding it is the Innermost Stable Circular Orbit (ISCO), the inner edge where gas leaves stable orbit and plunges into the singularity.
+                <strong className="text-cyan-400 block text-sm mb-0.5">1. 3D Spatial Hash Grid & Impulse Solver</strong>
+                Bodies are hashed into spatial volumetric cells for O(N) neighbor queries. When collisions occur, linear momentum is conserved, restitution scales normal velocity, and tangential friction imparts physical 3D angular torque/spin.
               </div>
               <div>
-                <strong className="text-cyan-400 block text-sm mb-0.5">2. Photon Ring (Einstein Ring)</strong>
-                A thin, luminous ring formed by photons deflected by intense gravity through orbits around the black hole before escaping toward your eye.
+                <strong className="text-rose-400 block text-sm mb-0.5">2. High-Energy Kinetic Fragmentation</strong>
+                If the impact kinetic energy exceeds the shatter threshold, parent asteroids fracture into 3 to 5 physical debris chunks that inherit parent momentum, conserve mass, and scatter radially.
               </div>
               <div>
-                <strong className="text-orange-400 block text-sm mb-0.5">3. Differential Keplerian Accretion Disk</strong>
-                Friction and gravitational shear heat orbiting dust and ionized plasma to millions of degrees Kelvin. Inner regions orbit faster than outer regions according to Kepler&apos;s laws (v ∝ 1/√r).
+                <strong className="text-amber-400 block text-sm mb-0.5">3. N-Body Massive Gravitational Perturbations</strong>
+                In addition to the central black hole inverse-square gravitational field, massive rogue planetoids and heavy bodies exert mutual Newtonian gravitational attraction on nearby asteroids.
               </div>
               <div>
-                <strong className="text-fuchsia-400 block text-sm mb-0.5">4. Relativistic Doppler Beaming</strong>
-                Gas moving toward the observer appears substantially boosted in brightness and blueshifted, while gas revolving away appears dimmed.
-              </div>
-              <div>
-                <strong className="text-emerald-400 block text-sm mb-0.5">5. Tidal Spaghettification & Newtonian Orbits</strong>
-                Matter falling toward the event horizon experiences extreme differential gravitational gradient forces, stretching along its radial path before crossing the event horizon.
+                <strong className="text-orange-400 block text-sm mb-0.5">4. Relativistic Spaghettification & Horizon Ingestion</strong>
+                As any solid body nears the Schwarzschild radius (Rs = 3.20 AU), extreme differential tidal acceleration stretches the geometry along the radial singularity axis before swallowing it into the event horizon.
               </div>
             </div>
 

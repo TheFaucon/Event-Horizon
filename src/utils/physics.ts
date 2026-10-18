@@ -302,9 +302,486 @@ export function stepNewtonianBody(
 export interface SimulationEvent {
   id: string;
   timestamp: string;
-  type: 'asteroid_consumed' | 'probe_consumed' | 'belt_respawn' | 'gravity_change';
+  type:
+    | 'asteroid_consumed'
+    | 'probe_consumed'
+    | 'belt_respawn'
+    | 'gravity_change'
+    | 'collision'
+    | 'fragmentation'
+    | 'planetoid_spawned'
+    | 'celestial_spawned'
+    | 'celestial_consumed';
   title: string;
   details: string;
   distanceAU?: number;
 }
+
+/**
+ * 3D Rigid-Body representation for asteroids, probes, debris chunks, and rogue planetoids.
+ */
+export interface RigidBody {
+  id: number;
+  type: 'asteroid' | 'probe' | 'debris' | 'planetoid';
+  // 3D position
+  x: number;
+  y: number;
+  z: number;
+  // 3D linear velocity
+  vx: number;
+  vy: number;
+  vz: number;
+  // 3D acceleration scratchpad
+  ax: number;
+  ay: number;
+  az: number;
+  // Physical properties
+  mass: number;         // Mass proportional to volume: density * (4/3)*pi*r^3
+  radius: number;       // Sphere collider radius
+  restitution: number;  // Bounciness coefficient
+  inertia: number;      // Moment of inertia for solid sphere: 0.4 * mass * radius^2
+  // 3D orientation & angular spin
+  rotX: number;
+  rotY: number;
+  rotZ: number;
+  angVx: number;
+  angVy: number;
+  angVz: number;
+  // State
+  isAlive: boolean;
+  spaghettifying: boolean;
+  generation: number;   // 0 = primary, 1 = fragment, 2 = fine fragment
+}
+
+/**
+ * Fast 3D Spatial Hash Grid for O(N) broadphase collision culling.
+ */
+export class SpatialHashGrid3D {
+  public cellSize: number;
+  public cells: Map<number, number[]>;
+
+  constructor(cellSize: number = 7.0) {
+    this.cellSize = cellSize;
+    this.cells = new Map();
+  }
+
+  public clear(): void {
+    this.cells.clear();
+  }
+
+  private hash(cx: number, cy: number, cz: number): number {
+    return ((cx * 73856093) ^ (cy * 19349663) ^ (cz * 83492791)) | 0;
+  }
+
+  public insert(bodyIndex: number, x: number, y: number, z: number): void {
+    const cx = Math.floor(x / this.cellSize);
+    const cy = Math.floor(y / this.cellSize);
+    const cz = Math.floor(z / this.cellSize);
+    const key = this.hash(cx, cy, cz);
+    let cell = this.cells.get(key);
+    if (!cell) {
+      cell = [];
+      this.cells.set(key, cell);
+    }
+    cell.push(bodyIndex);
+  }
+
+  public queryCandidates(x: number, y: number, z: number, radius: number): number[] {
+    const minCx = Math.floor((x - radius) / this.cellSize);
+    const maxCx = Math.floor((x + radius) / this.cellSize);
+    const minCy = Math.floor((y - radius) / this.cellSize);
+    const maxCy = Math.floor((y + radius) / this.cellSize);
+    const minCz = Math.floor((z - radius) / this.cellSize);
+    const maxCz = Math.floor((z + radius) / this.cellSize);
+
+    const candidates: number[] = [];
+    for (let cx = minCx; cx <= maxCx; cx++) {
+      for (let cy = minCy; cy <= maxCy; cy++) {
+        for (let cz = minCz; cz <= maxCz; cz++) {
+          const key = this.hash(cx, cy, cz);
+          const cell = this.cells.get(key);
+          if (cell) {
+            for (let i = 0; i < cell.length; i++) {
+              candidates.push(cell[i]);
+            }
+          }
+        }
+      }
+    }
+    return candidates;
+  }
+}
+
+export interface CollisionEventData {
+  collided: boolean;
+  impactEnergy: number;
+  normalImpulse: number;
+  contactX: number;
+  contactY: number;
+  contactZ: number;
+  normalX: number;
+  normalY: number;
+  normalZ: number;
+  shouldShatterA: boolean;
+  shouldShatterB: boolean;
+}
+
+/**
+ * Resolves 3D impulse collision between two rigid bodies with momentum conservation,
+ * kinetic energy transfer, positional penetration separation, and off-center angular torque.
+ */
+export function resolveRigidBodyCollision(
+  a: RigidBody,
+  b: RigidBody,
+  defaultRestitution: number = 0.65,
+  fragmentationThreshold: number = 38.0
+): CollisionEventData {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const dz = b.z - a.z;
+  const distSq = dx * dx + dy * dy + dz * dz;
+  const minDist = a.radius + b.radius;
+
+  if (distSq >= minDist * minDist || distSq <= 0.000001) {
+    return {
+      collided: false,
+      impactEnergy: 0,
+      normalImpulse: 0,
+      contactX: 0,
+      contactY: 0,
+      contactZ: 0,
+      normalX: 0,
+      normalY: 0,
+      normalZ: 0,
+      shouldShatterA: false,
+      shouldShatterB: false,
+    };
+  }
+
+  const dist = Math.sqrt(distSq);
+  const nx = dx / dist;
+  const ny = dy / dist;
+  const nz = dz / dist;
+
+  // 1. Positional Separation (Baumgarte stabilization)
+  const overlap = minDist - dist;
+  const invMassA = 1.0 / a.mass;
+  const invMassB = 1.0 / b.mass;
+  const totalInvMass = invMassA + invMassB;
+
+  if (totalInvMass > 0) {
+    const separationFactor = 0.8;
+    const moveA = (invMassA / totalInvMass) * overlap * separationFactor;
+    const moveB = (invMassB / totalInvMass) * overlap * separationFactor;
+
+    a.x -= nx * moveA;
+    a.y -= ny * moveA;
+    a.z -= nz * moveA;
+
+    b.x += nx * moveB;
+    b.y += ny * moveB;
+    b.z += nz * moveB;
+  }
+
+  // 2. Relative Velocity at Contact Point
+  const rAx = nx * a.radius;
+  const rAy = ny * a.radius;
+  const rAz = nz * a.radius;
+
+  const rBx = -nx * b.radius;
+  const rBy = -ny * b.radius;
+  const rBz = -nz * b.radius;
+
+  // Velocity due to angular spin: v_rot = omega x r
+  const vRotAx = a.angVy * rAz - a.angVz * rAy;
+  const vRotAy = a.angVz * rAx - a.angVx * rAz;
+  const vRotAz = a.angVx * rAy - a.angVy * rAx;
+
+  const vRotBx = b.angVy * rBz - b.angVz * rBy;
+  const vRotBy = b.angVz * rBx - b.angVx * rBz;
+  const vRotBz = b.angVx * rBy - b.angVy * rBx;
+
+  const totalVxA = a.vx + vRotAx;
+  const totalVyA = a.vy + vRotAy;
+  const totalVzA = a.vz + vRotAz;
+
+  const totalVxB = b.vx + vRotBx;
+  const totalVyB = b.vy + vRotBy;
+  const totalVzB = b.vz + vRotBz;
+
+  const relVx = totalVxB - totalVxA;
+  const relVy = totalVyB - totalVyA;
+  const relVz = totalVzB - totalVzA;
+
+  // Velocity along collision normal
+  const vn = relVx * nx + relVy * ny + relVz * nz;
+
+  // Do not resolve impulse if objects are already separating
+  if (vn > 0) {
+    return {
+      collided: true,
+      impactEnergy: 0,
+      normalImpulse: 0,
+      contactX: (a.x + b.x) * 0.5,
+      contactY: (a.y + b.y) * 0.5,
+      contactZ: (a.z + b.z) * 0.5,
+      normalX: nx,
+      normalY: ny,
+      normalZ: nz,
+      shouldShatterA: false,
+      shouldShatterB: false,
+    };
+  }
+
+  // 3. Normal Impulse Resolution
+  const e = Math.min(Math.min(a.restitution, b.restitution), defaultRestitution);
+  
+  // Rotational inertia terms along collision normal
+  const rACrossN_x = rAy * nz - rAz * ny;
+  const rACrossN_y = rAz * nx - rAx * nz;
+  const rACrossN_z = rAx * ny - rAy * nx;
+  const rotInertiaA = (rACrossN_x * rACrossN_x + rACrossN_y * rACrossN_y + rACrossN_z * rACrossN_z) / a.inertia;
+
+  const rBCrossN_x = rBy * nz - rBz * ny;
+  const rBCrossN_y = rBz * nx - rBx * nz;
+  const rBCrossN_z = rBx * ny - rBy * nx;
+  const rotInertiaB = (rBCrossN_x * rBCrossN_x + rBCrossN_y * rBCrossN_y + rBCrossN_z * rBCrossN_z) / b.inertia;
+
+  const normalDenominator = totalInvMass + rotInertiaA + rotInertiaB;
+  const jn = -(1.0 + e) * vn / Math.max(normalDenominator, 0.0001);
+
+  // Apply Normal Linear Impulse
+  a.vx -= jn * invMassA * nx;
+  a.vy -= jn * invMassA * ny;
+  a.vz -= jn * invMassA * nz;
+
+  b.vx += jn * invMassB * nx;
+  b.vy += jn * invMassB * ny;
+  b.vz += jn * invMassB * nz;
+
+  // 4. Tangential Friction Impulse & Angular Spin / Torque
+  const vtX = relVx - vn * nx;
+  const vtY = relVy - vn * ny;
+  const vtZ = relVz - vn * nz;
+  const vtMag = Math.sqrt(vtX * vtX + vtY * vtY + vtZ * vtZ);
+
+  if (vtMag > 0.001) {
+    const tx = vtX / vtMag;
+    const ty = vtY / vtMag;
+    const tz = vtZ / vtMag;
+
+    const frictionCoeff = 0.28;
+    const jtMax = frictionCoeff * jn;
+    const jt = Math.min(jtMax, (vtMag / Math.max(totalInvMass, 0.0001)) * 0.45);
+
+    // Linear friction damping
+    a.vx += jt * invMassA * tx;
+    a.vy += jt * invMassA * ty;
+    a.vz += jt * invMassA * tz;
+
+    b.vx -= jt * invMassB * tx;
+    b.vy -= jt * invMassB * ty;
+    b.vz -= jt * invMassB * tz;
+
+    // Torque on body A: tau = rA x (-J_tangent)
+    const tauAx = rAy * tz - rAz * ty;
+    const tauAy = rAz * tx - rAx * tz;
+    const tauAz = rAx * ty - rAy * tx;
+    a.angVx -= (tauAx * jt) / a.inertia;
+    a.angVy -= (tauAy * jt) / a.inertia;
+    a.angVz -= (tauAz * jt) / a.inertia;
+
+    // Torque on body B: tau = rB x (J_tangent)
+    const tauBx = rBy * tz - rBz * ty;
+    const tauBy = rBz * tx - rBx * tz;
+    const tauBz = rBx * ty - rBy * tx;
+    b.angVx += (tauBx * jt) / b.inertia;
+    b.angVy += (tauBy * jt) / b.inertia;
+    b.angVz += (tauBz * jt) / b.inertia;
+  }
+
+  // 5. Impact Kinetic Energy & Fragmentation Calculation
+  const reducedMass = (a.mass * b.mass) / (a.mass + b.mass);
+  const impactSpeedSq = vn * vn + 0.3 * (vtMag * vtMag);
+  const impactEnergy = 0.5 * reducedMass * impactSpeedSq;
+
+  let shouldShatterA = false;
+  let shouldShatterB = false;
+
+  if (impactEnergy >= fragmentationThreshold) {
+    // Cannot shatter planetoids or bodies that have already fragmented to generation 2
+    if (a.type !== 'planetoid' && a.radius >= 0.5 && a.generation < 2) {
+      shouldShatterA = true;
+    }
+    if (b.type !== 'planetoid' && b.radius >= 0.5 && b.generation < 2) {
+      shouldShatterB = true;
+    }
+  }
+
+  return {
+    collided: true,
+    impactEnergy,
+    normalImpulse: jn,
+    contactX: (a.x + b.x) * 0.5,
+    contactY: (a.y + b.y) * 0.5,
+    contactZ: (a.z + b.z) * 0.5,
+    normalX: nx,
+    normalY: ny,
+    normalZ: nz,
+    shouldShatterA,
+    shouldShatterB,
+  };
+}
+
+/**
+ * Shatters a parent asteroid into 3 to 5 physical debris chunks that inherit momentum,
+ * satisfy mass conservation, and disperse with explosive kinetic energy.
+ */
+export function shatterRigidBody(
+  parent: RigidBody,
+  impactNormal: [number, number, number],
+  getNextId: () => number,
+  chunkCount: number = 4
+): RigidBody[] {
+  parent.isAlive = false;
+
+  const chunks: RigidBody[] = [];
+  const chunkMass = parent.mass / chunkCount;
+  // Radius scales with cube root of mass for constant density
+  const chunkRadius = parent.radius * Math.pow(1.0 / chunkCount, 1 / 3) * 0.92;
+  const chunkInertia = 0.4 * chunkMass * chunkRadius * chunkRadius;
+
+  // Tangent and bitangent directions orthogonal to impact normal
+  const nx = impactNormal[0];
+  const ny = impactNormal[1];
+  const nz = impactNormal[2];
+
+  // Arbitrary perpendicular vector
+  let px = 0;
+  let py = 1;
+  let pz = 0;
+  if (Math.abs(ny) > 0.9) {
+    px = 1;
+    py = 0;
+  }
+
+  // Gram-Schmidt orthogonalization
+  const dotP = px * nx + py * ny + pz * nz;
+  let tx = px - dotP * nx;
+  let ty = py - dotP * ny;
+  let tz = pz - dotP * nz;
+  const tLen = Math.sqrt(tx * tx + ty * ty + tz * tz) || 1;
+  tx /= tLen;
+  ty /= tLen;
+  tz /= tLen;
+
+  // Bitangent = n x t
+  const bx = ny * tz - nz * ty;
+  const by = nz * tx - nx * tz;
+  const bz = nx * ty - ny * tx;
+
+  const scatterSpeed = 2.4 + Math.random() * 2.0;
+
+  for (let i = 0; i < chunkCount; i++) {
+    const angle = (i / chunkCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.4;
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+
+    // Direction outward in collision tangent plane
+    const dirX = tx * cosA + bx * sinA;
+    const dirY = ty * cosA + by * sinA;
+    const dirZ = tz * cosA + bz * sinA;
+
+    // Position offset so debris pieces do not overlap immediately
+    const offsetDist = parent.radius * 0.85;
+    const posX = parent.x + dirX * offsetDist;
+    const posY = parent.y + dirY * offsetDist;
+    const posZ = parent.z + dirZ * offsetDist;
+
+    // Linear velocity = parent velocity + radial scatter
+    const vx = parent.vx + dirX * scatterSpeed;
+    const vy = parent.vy + dirY * scatterSpeed;
+    const vz = parent.vz + dirZ * scatterSpeed;
+
+    chunks.push({
+      id: getNextId(),
+      type: 'debris',
+      x: posX,
+      y: posY,
+      z: posZ,
+      vx,
+      vy,
+      vz,
+      ax: 0,
+      ay: 0,
+      az: 0,
+      mass: chunkMass,
+      radius: chunkRadius,
+      restitution: parent.restitution,
+      inertia: chunkInertia,
+      rotX: Math.random() * Math.PI,
+      rotY: Math.random() * Math.PI,
+      rotZ: Math.random() * Math.PI,
+      angVx: (Math.random() - 0.5) * 6.0,
+      angVy: (Math.random() - 0.5) * 6.0,
+      angVz: (Math.random() - 0.5) * 6.0,
+      isAlive: true,
+      spaghettifying: false,
+      generation: parent.generation + 1,
+    });
+  }
+
+  return chunks;
+}
+
+/**
+ * Calculates local gravitational perturbations from massive bodies (such as rogue planetoids).
+ */
+export function computeNBodyPerturbations(
+  target: RigidBody,
+  massiveBodies: RigidBody[],
+  gConstant: number = 4.0
+): [number, number, number] {
+  let pax = 0;
+  let pay = 0;
+  let paz = 0;
+
+  for (let i = 0; i < massiveBodies.length; i++) {
+    const mb = massiveBodies[i];
+    if (mb.id === target.id || !mb.isAlive) continue;
+
+    const dx = mb.x - target.x;
+    const dy = mb.y - target.y;
+    const dz = mb.z - target.z;
+    const distSq = dx * dx + dy * dy + dz * dz + 4.0; // Softening
+    const dist = Math.sqrt(distSq);
+
+    const accel = (gConstant * mb.mass) / distSq;
+    pax += (dx / dist) * accel;
+    pay += (dy / dist) * accel;
+    paz += (dz / dist) * accel;
+  }
+
+  return [pax, pay, paz];
+}
+
+/**
+ * Velocity Verlet integration step for rigid body position and orientation.
+ */
+export function integrateRigidBodyVerlet(body: RigidBody, dt: number): void {
+  // Update linear velocity and position
+  body.vx += body.ax * dt;
+  body.vy += body.ay * dt;
+  body.vz += body.az * dt;
+
+  body.x += body.vx * dt;
+  body.y += body.vy * dt;
+  body.z += body.vz * dt;
+
+  // Update angular orientation
+  body.rotX += body.angVx * dt;
+  body.rotY += body.angVy * dt;
+  body.rotZ += body.angVz * dt;
+}
+
 

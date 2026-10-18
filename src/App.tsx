@@ -6,8 +6,10 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { CameraPreset, DEFAULT_CONFIG, SimulationConfig } from './types/simulation';
 import { SimulationEvent } from './utils/physics';
+import { CelestialBodyDefinition, CELESTIAL_PRESETS } from './types/celestial';
 import { ThreeCanvas } from './components/ThreeCanvas';
 import { HUDOverlay } from './components/HUDOverlay';
+import { CelestialCreatorModal } from './components/CelestialCreatorModal';
 import { spaceAudio } from './audio/spaceAudio';
 
 export default function App() {
@@ -15,9 +17,28 @@ export default function App() {
   const [cameraPreset, setCameraPreset] = useState<CameraPreset | null>(null);
   const [launchProbeTrigger, setLaunchProbeTrigger] = useState<number>(0);
   const [respawnBeltTrigger, setRespawnBeltTrigger] = useState<number>(0);
+  const [spawnPlanetoidTrigger, setSpawnPlanetoidTrigger] = useState<number>(0);
   const [consumedCount, setConsumedCount] = useState<number>(0);
   const [fps, setFps] = useState<number>(60);
   const [activeParticles, setActiveParticles] = useState<number>(DEFAULT_CONFIG.particleCount);
+  const [activeBodies, setActiveBodies] = useState<number>(DEFAULT_CONFIG.asteroidCount);
+  const [totalCollisions, setTotalCollisions] = useState<number>(0);
+
+  // Celestial Bodies in Orbit
+  const [celestialBodies, setCelestialBodies] = useState<CelestialBodyDefinition[]>([
+    {
+      ...CELESTIAL_PRESETS[1], // Chronos-9 ringed gas giant with 2 moons
+      id: 'init-chronos-1',
+      orbitalAngle: 1.18,
+    },
+    {
+      ...CELESTIAL_PRESETS[0], // Gaia Prime with Selene moon
+      id: 'init-gaia-2',
+      orbitalAngle: 1.92,
+    },
+  ]);
+  const [isCelestialModalOpen, setIsCelestialModalOpen] = useState<boolean>(false);
+  const [trackedBodyId, setTrackedBodyId] = useState<string | null>(null);
 
   // Real-time Event Log state
   const [events, setEvents] = useState<SimulationEvent[]>([
@@ -25,13 +46,23 @@ export default function App() {
       id: 'init-1',
       timestamp: new Date().toLocaleTimeString([], { hour12: false }),
       type: 'belt_respawn',
-      title: 'Stable Resonance',
-      details: 'Asteroid belt initialized with Newtonian orbits in stable 1.00G equilibrium.',
+      title: 'Système Initialisé',
+      details: 'Ceinture d\'astéroïdes et planètes insérées en orbite képlérienne stable à 1.00G.',
       distanceAU: DEFAULT_CONFIG.asteroidBeltRadius,
+    },
+    {
+      id: 'init-2',
+      timestamp: new Date().toLocaleTimeString([], { hour12: false }),
+      type: 'celestial_spawned',
+      title: 'Planète en Orbite',
+      details: 'Chronos-9 (Géante aux Anneaux & 2 Lunes) en orbite à 54.0 AU.',
+      distanceAU: 54.0,
     },
   ]);
 
   const lastLoggedGravityRef = useRef<number>(DEFAULT_CONFIG.gravityPull);
+  const lastCollisionLogTimeRef = useRef<number>(0);
+  const lastFragmentLogTimeRef = useRef<number>(0);
 
   const addEvent = useCallback((event: Omit<SimulationEvent, 'id' | 'timestamp'>) => {
     const newEntry: SimulationEvent = {
@@ -40,7 +71,7 @@ export default function App() {
       timestamp: new Date().toLocaleTimeString([], { hour12: false }),
     };
 
-    setEvents((prev) => [newEntry, ...prev.slice(0, 49)]); // Keep last 50 events
+    setEvents((prev) => [newEntry, ...prev.slice(0, 59)]); // Keep last 60 events
   }, []);
 
   const handleConfigChange = useCallback((updater: (prev: SimulationConfig) => SimulationConfig) => {
@@ -61,9 +92,9 @@ export default function App() {
         lastLoggedGravityRef.current = next.gravityPull;
         addEvent({
           type: 'gravity_change',
-          title: 'Gravity Scaled',
-          details: `Newtonian gravitational parameter shifted to ${next.gravityPull.toFixed(2)}G.${
-            next.gravityPull > 1.25 ? ' Inward orbital decay initiated.' : ''
+          title: 'Gravité Modifiée',
+          details: `Paramètre gravitationnel newtonien ajusté à ${next.gravityPull.toFixed(2)}G.${
+            next.gravityPull > 1.25 ? ' Déclin orbital vers le trou noir amorcé.' : ''
           }`,
         });
       }
@@ -73,6 +104,7 @@ export default function App() {
   }, [addEvent]);
 
   const handleSelectCameraPreset = useCallback((preset: CameraPreset) => {
+    setTrackedBodyId(null);
     setCameraPreset(preset);
   }, []);
 
@@ -84,8 +116,8 @@ export default function App() {
     setLaunchProbeTrigger((prev) => prev + 1);
     addEvent({
       type: 'probe_consumed',
-      title: 'Probe Deployed',
-      details: 'Matter probe launched into outer accretion disk trajectory.',
+      title: 'Sonde Déployée',
+      details: 'Sonde de matière lancée sur trajectoire de capture avec physique corps-rigide.',
       distanceAU: 28.0,
     });
   }, [addEvent]);
@@ -94,18 +126,86 @@ export default function App() {
     setRespawnBeltTrigger((prev) => prev + 1);
     addEvent({
       type: 'belt_respawn',
-      title: 'Belt Respawned',
-      details: `Asteroid belt re-seeded at ${config.asteroidBeltRadius} AU with stable 1.0G circular velocities.`,
+      title: 'Ceinture Réinitialisée',
+      details: `Ceinture d'astéroïdes recréée à ${config.asteroidBeltRadius} AU avec ${config.asteroidCount} corps solides.`,
       distanceAU: config.asteroidBeltRadius,
     });
-  }, [config.asteroidBeltRadius, addEvent]);
+  }, [config.asteroidBeltRadius, config.asteroidCount, addEvent]);
+
+  const handleSpawnPlanetoid = useCallback(() => {
+    setSpawnPlanetoidTrigger((prev) => prev + 1);
+    addEvent({
+      type: 'planetoid_spawned',
+      title: 'Planétoïde Errant En Approche',
+      details: 'Un planétoïde massif de 320 MT fonce à travers la ceinture vers le trou noir !',
+      distanceAU: 64.0,
+    });
+  }, [addEvent]);
+
+  // Celestial Bodies Management
+  const handleSpawnCelestialBody = useCallback((definition: CelestialBodyDefinition) => {
+    setCelestialBodies((prev) => [...prev, definition]);
+    spaceAudio.playCelestialSpawn();
+    addEvent({
+      type: 'celestial_spawned',
+      title: 'Corps Céleste en Orbite',
+      details: `${definition.name} (${definition.type}) placé en orbite à ${definition.orbitalRadius} AU avec ${definition.moons.length} lune(s)${definition.hasRings ? ' et anneaux' : ''}.`,
+      distanceAU: definition.orbitalRadius,
+    });
+  }, [addEvent]);
+
+  const handleQuickSpawnCelestial = useCallback((presetId: string) => {
+    const preset = CELESTIAL_PRESETS.find((p) => p.id === presetId) || CELESTIAL_PRESETS[0];
+    const newBody: CelestialBodyDefinition = {
+      ...preset,
+      id: `celestial-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      orbitalAngle: Math.random() * Math.PI * 2,
+    };
+    handleSpawnCelestialBody(newBody);
+  }, [handleSpawnCelestialBody]);
+
+  const handleRemoveCelestialBody = useCallback((id: string) => {
+    setCelestialBodies((prev) => prev.filter((b) => b.id !== id));
+    if (trackedBodyId === id) {
+      setTrackedBodyId(null);
+    }
+  }, [trackedBodyId]);
+
+  const handleTrackCelestialBody = useCallback((id: string | null) => {
+    setTrackedBodyId(id);
+    if (id) {
+      const target = celestialBodies.find((b) => b.id === id);
+      if (target) {
+        addEvent({
+          type: 'celestial_spawned',
+          title: 'Caméra en Suivi Orbital',
+          details: `Verrouillage de la caméra sur ${target.name} en orbite à ${target.orbitalRadius} AU.`,
+          distanceAU: target.orbitalRadius,
+        });
+      }
+    }
+  }, [celestialBodies, addEvent]);
+
+  const handleCelestialConsumed = useCallback((id: string, name: string) => {
+    setConsumedCount((prev) => prev + 1);
+    setCelestialBodies((prev) => prev.filter((b) => b.id !== id));
+    if (trackedBodyId === id) {
+      setTrackedBodyId(null);
+    }
+    addEvent({
+      type: 'celestial_consumed',
+      title: 'Planète Dévorée',
+      details: `${name} a franchi l'horizon des événements et a été aspiré par la singularité !`,
+      distanceAU: 3.2,
+    });
+  }, [trackedBodyId, addEvent]);
 
   const handleAsteroidConsumed = useCallback((id: number, distanceAU: number) => {
     setConsumedCount((prev) => prev + 1);
     addEvent({
       type: 'asteroid_consumed',
-      title: 'Asteroid Consumed',
-      details: `Asteroid #${id} crossed the event horizon following relativistic spaghettification.`,
+      title: 'Astéroïde Consommé',
+      details: `Astéroïde #${id} a franchi l'horizon suite à la spaghettification gravitationnelle.`,
       distanceAU,
     });
   }, [addEvent]);
@@ -114,19 +214,56 @@ export default function App() {
     setConsumedCount((prev) => prev + 1);
     addEvent({
       type: 'probe_consumed',
-      title: 'Probe Devoured',
-      details: `Scientific probe #${id} plunged past ISCO into the black hole singularity.`,
+      title: 'Sonde Aspirée',
+      details: `La sonde #${id} a plongé au-delà de l'ISCO dans le trou noir.`,
       distanceAU,
     });
+  }, [addEvent]);
+
+  const handlePlanetoidConsumed = useCallback(() => {
+    setConsumedCount((prev) => prev + 1);
+    addEvent({
+      type: 'planetoid_spawned',
+      title: 'Planétoïde Englouti',
+      details: 'Le planétoïde errant a été déchiré par les forces de marée et dévoré !',
+      distanceAU: 3.2,
+    });
+  }, [addEvent]);
+
+  const handleCollisionEvent = useCallback((impactEnergy: number, bodyTypeA: string, bodyTypeB: string) => {
+    const now = Date.now();
+    if (impactEnergy >= 16.0 && now - lastCollisionLogTimeRef.current > 900) {
+      lastCollisionLogTimeRef.current = now;
+      addEvent({
+        type: 'collision',
+        title: 'Collision Corps-Rigides',
+        details: `${bodyTypeA.toUpperCase()} a heurté ${bodyTypeB.toUpperCase()} (${impactEnergy.toFixed(1)} J). Transfert d'impulsion.`,
+      });
+    }
+  }, [addEvent]);
+
+  const handleFragmentationEvent = useCallback((chunkCount: number, distanceAU: number) => {
+    const now = Date.now();
+    if (now - lastFragmentLogTimeRef.current > 1200) {
+      lastFragmentLogTimeRef.current = now;
+      addEvent({
+        type: 'fragmentation',
+        title: 'Impact Catastrophique',
+        details: `L'énergie d'impact a pulvérisé le corps en ${chunkCount} débris physiques orbitaux.`,
+        distanceAU,
+      });
+    }
   }, [addEvent]);
 
   const handleClearEvents = useCallback(() => {
     setEvents([]);
   }, []);
 
-  const handleTelemetryUpdate = useCallback((newFps: number, particleCount: number) => {
+  const handleTelemetryUpdate = useCallback((newFps: number, particleCount: number, bodiesCount: number, collisionsCount: number) => {
     setFps(newFps);
     setActiveParticles(particleCount);
+    setActiveBodies(bodiesCount);
+    setTotalCollisions(collisionsCount);
   }, []);
 
   return (
@@ -138,8 +275,15 @@ export default function App() {
         onCameraPresetHandled={handleCameraPresetHandled}
         onAsteroidConsumed={handleAsteroidConsumed}
         onProbeConsumed={handleProbeConsumed}
+        onPlanetoidConsumed={handlePlanetoidConsumed}
+        onCollisionEvent={handleCollisionEvent}
+        onFragmentationEvent={handleFragmentationEvent}
         launchProbeTrigger={launchProbeTrigger}
         respawnBeltTrigger={respawnBeltTrigger}
+        spawnPlanetoidTrigger={spawnPlanetoidTrigger}
+        celestialBodies={celestialBodies}
+        trackedBodyId={trackedBodyId}
+        onCelestialConsumed={handleCelestialConsumed}
         onTelemetryUpdate={handleTelemetryUpdate}
       />
 
@@ -150,11 +294,28 @@ export default function App() {
         onSelectCameraPreset={handleSelectCameraPreset}
         onLaunchProbe={handleLaunchProbe}
         onRespawnBelt={handleRespawnBelt}
+        onSpawnPlanetoid={handleSpawnPlanetoid}
+        onOpenCelestialModal={() => setIsCelestialModalOpen(true)}
+        celestialBodiesCount={celestialBodies.length}
+        onQuickSpawnCelestial={handleQuickSpawnCelestial}
         events={events}
         onClearEvents={handleClearEvents}
         probesDevouredCount={consumedCount}
         fps={fps}
         activeParticles={activeParticles}
+        activeBodies={activeBodies}
+        totalCollisions={totalCollisions}
+      />
+
+      {/* Interactive Celestial Body Creator Modal */}
+      <CelestialCreatorModal
+        isOpen={isCelestialModalOpen}
+        onClose={() => setIsCelestialModalOpen(false)}
+        onSpawnCelestialBody={handleSpawnCelestialBody}
+        activeBodies={celestialBodies}
+        onRemoveCelestialBody={handleRemoveCelestialBody}
+        onTrackCelestialBody={handleTrackCelestialBody}
+        trackedBodyId={trackedBodyId}
       />
     </main>
   );

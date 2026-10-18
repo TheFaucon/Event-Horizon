@@ -4,7 +4,7 @@
  */
 
 import React, { useState } from 'react';
-import { ScrollText, ChevronDown, ChevronUp, Trash2, AlertTriangle, Disc, Orbit, Gauge } from 'lucide-react';
+import { ScrollText, ChevronDown, ChevronUp, Trash2, AlertTriangle, Disc, Orbit, Gauge, Zap, Flame, Globe2 } from 'lucide-react';
 import { SimulationEvent } from '../utils/physics';
 
 interface EventLogProps {
@@ -14,14 +14,17 @@ interface EventLogProps {
 
 export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => {
   const [isOpen, setIsOpen] = useState<boolean>(false);
-  const [filter, setFilter] = useState<'all' | 'consumed' | 'system'>('all');
+  const [filter, setFilter] = useState<'all' | 'consumed' | 'collisions' | 'system'>('all');
 
   const filteredEvents = events.filter((e) => {
     if (filter === 'consumed') {
       return e.type === 'asteroid_consumed' || e.type === 'probe_consumed';
     }
+    if (filter === 'collisions') {
+      return e.type === 'collision' || e.type === 'fragmentation';
+    }
     if (filter === 'system') {
-      return e.type === 'gravity_change' || e.type === 'belt_respawn';
+      return e.type === 'gravity_change' || e.type === 'belt_respawn' || e.type === 'planetoid_spawned';
     }
     return true;
   });
@@ -32,6 +35,16 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
         return <Orbit className="w-3.5 h-3.5 text-amber-400" />;
       case 'probe_consumed':
         return <Disc className="w-3.5 h-3.5 text-orange-400" />;
+      case 'collision':
+        return <Zap className="w-3.5 h-3.5 text-amber-300" />;
+      case 'fragmentation':
+        return <Flame className="w-3.5 h-3.5 text-rose-400" />;
+      case 'planetoid_spawned':
+        return <Globe2 className="w-3.5 h-3.5 text-red-400" />;
+      case 'celestial_spawned':
+        return <Globe2 className="w-3.5 h-3.5 text-indigo-400" />;
+      case 'celestial_consumed':
+        return <Flame className="w-3.5 h-3.5 text-rose-400" />;
       case 'gravity_change':
         return <Gauge className="w-3.5 h-3.5 text-cyan-400" />;
       case 'belt_respawn':
@@ -47,6 +60,16 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
         return 'bg-amber-950/60 text-amber-300 border-amber-800/60';
       case 'probe_consumed':
         return 'bg-orange-950/60 text-orange-300 border-orange-800/60';
+      case 'collision':
+        return 'bg-yellow-950/60 text-yellow-300 border-yellow-800/60';
+      case 'fragmentation':
+        return 'bg-rose-950/70 text-rose-300 border-rose-800/70';
+      case 'planetoid_spawned':
+        return 'bg-red-950/80 text-red-200 border-red-700/80';
+      case 'celestial_spawned':
+        return 'bg-indigo-950/70 text-indigo-300 border-indigo-800/70';
+      case 'celestial_consumed':
+        return 'bg-rose-950/80 text-rose-200 border-rose-700/80';
       case 'gravity_change':
         return 'bg-cyan-950/60 text-cyan-300 border-cyan-800/60';
       case 'belt_respawn':
@@ -104,11 +127,11 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
           </div>
 
           {/* Filter Pills */}
-          <div className="flex items-center space-x-1 px-3 py-2 border-b border-neutral-800/60 bg-neutral-950 text-[11px]">
+          <div className="flex items-center space-x-1 px-3 py-2 border-b border-neutral-800/60 bg-neutral-950 text-[11px] overflow-x-auto">
             <button
               type="button"
               onClick={() => setFilter('all')}
-              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+              className={`px-2 py-0.5 rounded cursor-pointer whitespace-nowrap transition-colors ${
                 filter === 'all'
                   ? 'bg-neutral-800 text-white font-medium'
                   : 'text-neutral-400 hover:text-neutral-200'
@@ -118,8 +141,19 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
             </button>
             <button
               type="button"
+              onClick={() => setFilter('collisions')}
+              className={`px-2 py-0.5 rounded cursor-pointer whitespace-nowrap transition-colors ${
+                filter === 'collisions'
+                  ? 'bg-yellow-950/80 text-yellow-300 font-medium border border-yellow-800/50'
+                  : 'text-neutral-400 hover:text-neutral-200'
+              }`}
+            >
+              Collisions & Debris
+            </button>
+            <button
+              type="button"
               onClick={() => setFilter('consumed')}
-              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+              className={`px-2 py-0.5 rounded cursor-pointer whitespace-nowrap transition-colors ${
                 filter === 'consumed'
                   ? 'bg-amber-950/80 text-amber-300 font-medium border border-amber-800/50'
                   : 'text-neutral-400 hover:text-neutral-200'
@@ -130,13 +164,13 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
             <button
               type="button"
               onClick={() => setFilter('system')}
-              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+              className={`px-2 py-0.5 rounded cursor-pointer whitespace-nowrap transition-colors ${
                 filter === 'system'
                   ? 'bg-cyan-950/80 text-cyan-300 font-medium border border-cyan-800/50'
                   : 'text-neutral-400 hover:text-neutral-200'
               }`}
             >
-              Gravity & System
+              System & Gravity
             </button>
           </div>
 
@@ -144,7 +178,7 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
           <div className="flex-1 overflow-y-auto p-2.5 space-y-2 max-h-[320px] font-mono text-xs">
             {filteredEvents.length === 0 ? (
               <div className="text-center py-8 text-neutral-500 text-xs">
-                No events recorded yet. Increase Gravity Pull or launch a probe to initiate orbital decay.
+                No events recorded in this category yet.
               </div>
             ) : (
               filteredEvents.map((event) => (
@@ -180,7 +214,7 @@ export const EventLog: React.FC<EventLogProps> = ({ events, onClearEvents }) => 
           {/* Footer Info */}
           <div className="px-3 py-1.5 border-t border-neutral-800 bg-neutral-950 text-[10px] text-neutral-500 flex justify-between items-center">
             <span>Event Horizon: 3.20 AU</span>
-            <span>Real-time Keplerian / Newtonian Telemetry</span>
+            <span>3D Rigid-Body Simulation Telemetry</span>
           </div>
         </div>
       )}

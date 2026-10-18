@@ -175,6 +175,142 @@ class SpaceAudioEngine {
     }
   }
 
+  private lastImpactTime: number = 0;
+
+  /**
+   * Sound effect for high-energy asteroid/probe collisions and fragmentation.
+   */
+  public playImpactCrunch(energy: number = 20.0): void {
+    if (!this.ctx || !this.isRunning) return;
+    const now = performance.now();
+    if (now - this.lastImpactTime < 90) return; // Throttle to prevent audio buffer saturation
+    this.lastImpactTime = now;
+
+    try {
+      const t = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      const filter = this.ctx.createBiquadFilter();
+
+      // Pitch inversely proportional to impact energy
+      const baseFreq = Math.max(90, 240 - Math.min(energy, 100));
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(baseFreq, t);
+      osc.frequency.exponentialRampToValueAtTime(40, t + 0.18);
+
+      filter.type = 'bandpass';
+      filter.frequency.setValueAtTime(320, t);
+      filter.Q.value = 3.0;
+
+      const vol = Math.min(0.25, 0.08 + (energy / 150) * 0.15);
+      gain.gain.setValueAtTime(vol, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+
+      osc.connect(filter);
+      filter.connect(gain);
+      if (this.masterGain) {
+        gain.connect(this.masterGain);
+      } else {
+        gain.connect(this.ctx.destination);
+      }
+
+      osc.start(t);
+      osc.stop(t + 0.2);
+    } catch {
+      // Audio fallback
+    }
+  }
+
+  /**
+   * Heavy gravitational rumble when a massive Rogue Planetoid is injected.
+   */
+  public playPlanetoidRoar(): void {
+    if (!this.ctx || !this.isRunning) return;
+    try {
+      const t = this.ctx.currentTime;
+      const osc1 = this.ctx.createOscillator();
+      const osc2 = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc1.type = 'sawtooth';
+      osc1.frequency.setValueAtTime(55, t);
+      osc1.frequency.exponentialRampToValueAtTime(32, t + 2.0);
+
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(28, t);
+      osc2.frequency.exponentialRampToValueAtTime(18, t + 2.5);
+
+      const filter = this.ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(110, t);
+
+      gain.gain.setValueAtTime(0.35, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 2.5);
+
+      osc1.connect(filter);
+      osc2.connect(filter);
+      filter.connect(gain);
+
+      if (this.masterGain) {
+        gain.connect(this.masterGain);
+      } else {
+        gain.connect(this.ctx.destination);
+      }
+
+      osc1.start(t);
+      osc2.start(t);
+      osc1.stop(t + 2.6);
+      osc2.stop(t + 2.6);
+    } catch {
+      // Audio fallback
+    }
+  }
+
+  /**
+   * Sound effect when spawning a new planet or celestial body into orbit.
+   */
+  public playCelestialSpawn(): void {
+    if (!this.ctx || !this.isRunning) return;
+    try {
+      const now = this.ctx.currentTime;
+      const osc1 = this.ctx.createOscillator();
+      const osc2 = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc1.type = 'sine';
+      osc2.type = 'triangle';
+
+      // Celestial fifth chord (A4 440Hz -> E5 660Hz) with gentle glide
+      osc1.frequency.setValueAtTime(220, now);
+      osc1.frequency.exponentialRampToValueAtTime(440, now + 0.35);
+      osc1.frequency.exponentialRampToValueAtTime(330, now + 1.2);
+
+      osc2.frequency.setValueAtTime(330, now);
+      osc2.frequency.exponentialRampToValueAtTime(660, now + 0.35);
+      osc2.frequency.exponentialRampToValueAtTime(495, now + 1.4);
+
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.linearRampToValueAtTime(0.18, now + 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.6);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+
+      if (this.masterGain) {
+        gain.connect(this.masterGain);
+      } else {
+        gain.connect(this.ctx.destination);
+      }
+
+      osc1.start(now);
+      osc2.start(now);
+      osc1.stop(now + 1.7);
+      osc2.stop(now + 1.7);
+    } catch {
+      // Audio fallback
+    }
+  }
+
   /**
    * Modulate audio parameters based on simulation speed or proximity.
    */

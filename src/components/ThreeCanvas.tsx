@@ -19,49 +19,35 @@ import {
   computeDopplerBeamingFactor,
   computeGravitationalAcceleration,
   computeInwardDrift,
+  computeNBodyPerturbations,
   computeSpaghettificationScale,
   computeStableOrbitalVelocity,
   getParticleColorByRadius,
+  integrateRigidBodyVerlet,
+  resolveRigidBodyCollision,
+  shatterRigidBody,
+  RigidBody,
+  SpatialHashGrid3D,
   COLOR_PALETTES,
 } from '../utils/physics';
+import { CelestialBodyDefinition, MoonConfig } from '../types/celestial';
+import {
+  calculateCelestialOrbitalPosition,
+  calculateCelestialOrbitalVelocity,
+  calculateMoonPosition,
+  generateOrbitPathPoints,
+} from '../utils/celestialPhysics';
 import {
   createAsteroidGeometry,
   createAsteroidTextures,
+  createCelestialTexture,
+  createMoonTexture,
   createNebulaTexture,
   createParticleTexture,
+  createPlanetoidTextures,
+  createRingTexture,
 } from '../utils/textures';
 import { spaceAudio } from '../audio/spaceAudio';
-
-interface NewtonianProbe {
-  id: number;
-  mesh: THREE.Mesh;
-  glowMesh: THREE.Mesh;
-  x: number;
-  y: number;
-  z: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  active: boolean;
-  birthTime: number;
-}
-
-interface AsteroidBody {
-  id: number;
-  x: number;
-  y: number;
-  z: number;
-  vx: number;
-  vy: number;
-  vz: number;
-  scale: number;
-  rotX: number;
-  rotY: number;
-  rotZ: number;
-  spinSpeedX: number;
-  spinSpeedY: number;
-  consumed: boolean;
-}
 
 interface ThreeCanvasProps {
   config: SimulationConfig;
@@ -69,12 +55,19 @@ interface ThreeCanvasProps {
   onCameraPresetHandled: () => void;
   onAsteroidConsumed?: (id: number, distanceAU: number) => void;
   onProbeConsumed?: (id: number, distanceAU: number) => void;
+  onPlanetoidConsumed?: () => void;
+  onCollisionEvent?: (impactEnergy: number, bodyTypeA: string, bodyTypeB: string) => void;
+  onFragmentationEvent?: (chunkCount: number, distanceAU: number) => void;
   launchProbeTrigger: number;
   respawnBeltTrigger: number;
-  onTelemetryUpdate: (fps: number, activeParticles: number) => void;
+  spawnPlanetoidTrigger: number;
+  celestialBodies: CelestialBodyDefinition[];
+  trackedBodyId: string | null;
+  onCelestialConsumed?: (id: string, name: string) => void;
+  onTelemetryUpdate: (fps: number, activeParticles: number, activeBodies: number, totalCollisions: number) => void;
 }
 
-// Pre-allocated math scratchpads (Zero-GC in render loop)
+// Scratchpad math objects (Zero-GC inside 60 FPS tick)
 const _scratchVec3 = new THREE.Vector3();
 const _scratchPos = new THREE.Vector3();
 const _scratchMatrix = new THREE.Matrix4();
@@ -86,7 +79,8 @@ const _camLookTarget = new THREE.Vector3();
 const _scratchTarget = new THREE.Vector3();
 
 const MAX_PARTICLES = 30000;
-const MAX_ASTEROIDS = 1200;
+const MAX_RIGID_BODIES = 1200;
+const MAX_SPARKS = 450;
 const EVENT_HORIZON_RADIUS = 3.2;
 const ISCO_RADIUS = 4.2;
 const DISK_OUTER_RADIUS = 28.0;
@@ -97,31 +91,97 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
   onCameraPresetHandled,
   onAsteroidConsumed,
   onProbeConsumed,
+  onPlanetoidConsumed,
+  onCollisionEvent,
+  onFragmentationEvent,
   launchProbeTrigger,
   respawnBeltTrigger,
+  spawnPlanetoidTrigger,
+  celestialBodies,
+  trackedBodyId,
+  onCelestialConsumed,
   onTelemetryUpdate,
 }) => {
   const mountRef = useRef<HTMLDivElement>(null);
   const configRef = useRef(config);
   configRef.current = config;
 
-  // Refs for scene interaction & physics
+  // Scene references
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
-  const probesRef = useRef<NewtonianProbe[]>([]);
-  const probeIdCounterRef = useRef<number>(1);
   const isTransitioningCameraRef = useRef(false);
 
-  // Asteroid belt data ref
-  const asteroidBodiesRef = useRef<AsteroidBody[]>([]);
+  // Rigid-body physics references
+  const rigidBodiesRef = useRef<RigidBody[]>([]);
+  const spatialGridRef = useRef<SpatialHashGrid3D>(new SpatialHashGrid3D(7.5));
   const asteroidMeshRef = useRef<THREE.InstancedMesh | null>(null);
+  const roguePlanetoidMeshRef = useRef<THREE.Mesh | null>(null);
+  const probeMeshesRef = useRef<Map<number, THREE.Mesh>>(new Map());
+  const bodyIdCounterRef = useRef<number>(1);
+  const totalCollisionsCounterRef = useRef<number>(0);
 
-  // Trigger launch probe with Newtonian initial trajectory
+  // Orbiting Celestial Bodies reference
+  interface CelestialRenderData {
+    definition: CelestialBodyDefinition;
+    group: THREE.Group;
+    planetMesh: THREE.Mesh;
+    atmosphereMesh?: THREE.Mesh;
+    ringMesh?: THREE.Mesh;
+    orbitLine?: THREE.LineLoop;
+    moons: {
+      config: MoonConfig;
+      mesh: THREE.Mesh;
+      currentAngle: number;
+    }[];
+    x: number;
+    y: number;
+    z: number;
+    vx: number;
+    vy: number;
+    vz: number;
+    isAlive: boolean;
+  }
+  const celestialMeshesRef = useRef<Map<string, CelestialRenderData>>(new Map());
+  const trackedBodyIdRef = useRef(trackedBodyId);
+  trackedBodyIdRef.current = trackedBodyId;
+
+  // Sparks particle references
+  const sparksPosRef = useRef<Float32Array>(new Float32Array(MAX_SPARKS * 3));
+  const sparksVelRef = useRef<Float32Array>(new Float32Array(MAX_SPARKS * 3));
+  const sparksLifeRef = useRef<Float32Array>(new Float32Array(MAX_SPARKS)); // 0 = dead, 1 = brand new
+  const nextSparkIdxRef = useRef<number>(0);
+  const sparksPointsRef = useRef<THREE.Points | null>(null);
+
+  // Emit collision sparks
+  const emitSparks = (cx: number, cy: number, cz: number, nx: number, ny: number, nz: number, count: number = 10) => {
+    const pos = sparksPosRef.current;
+    const vel = sparksVelRef.current;
+    const life = sparksLifeRef.current;
+    let idx = nextSparkIdxRef.current;
+
+    for (let i = 0; i < count; i++) {
+      const s = idx % MAX_SPARKS;
+      pos[s * 3] = cx + (Math.random() - 0.5) * 0.4;
+      pos[s * 3 + 1] = cy + (Math.random() - 0.5) * 0.4;
+      pos[s * 3 + 2] = cz + (Math.random() - 0.5) * 0.4;
+
+      // Cone scatter away from collision surface
+      const speed = 3.5 + Math.random() * 7.5;
+      vel[s * 3] = (nx * 0.6 + (Math.random() - 0.5) * 0.8) * speed;
+      vel[s * 3 + 1] = (ny * 0.6 + (Math.random() - 0.5) * 0.8) * speed;
+      vel[s * 3 + 2] = (nz * 0.6 + (Math.random() - 0.5) * 0.8) * speed;
+
+      life[s] = 1.0;
+      idx++;
+    }
+    nextSparkIdxRef.current = idx;
+  };
+
+  // Launch Newtonian probe with rigid-body physics
   useEffect(() => {
     if (launchProbeTrigger === 0 || !sceneRef.current) return;
-    
-    // Launch a new probe from outer accretion boundary
+
     const spawnAngle = Math.random() * Math.PI * 2;
     const spawnRadius = DISK_OUTER_RADIUS + (Math.random() * 4 - 1);
     const spawnHeight = (Math.random() - 0.5) * 1.5;
@@ -130,61 +190,163 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     const y = spawnHeight;
     const z = Math.sin(spawnAngle) * spawnRadius;
 
-    // Stable orbital velocity with an inward decay kick
+    // Stable circular velocity + 15% inward tangential perturbation for decaying orbit
     const [baseVx, baseVy, baseVz] = computeStableOrbitalVelocity(x, y, z, BASE_BLACK_HOLE_GM);
-    // 82% tangential velocity initiates an inward spiral trajectory under gravity
-    const vx = baseVx * 0.82;
+    const vx = baseVx * 0.84;
     const vy = baseVy;
-    const vz = baseVz * 0.82;
+    const vz = baseVz * 0.84;
 
-    const probeGeo = new THREE.SphereGeometry(0.35, 16, 16);
-    const probeMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-    });
+    const probeId = bodyIdCounterRef.current++;
+    const probeRadius = 0.55;
+    const probeMass = 3.5;
+
+    const probeGeo = new THREE.SphereGeometry(probeRadius, 16, 16);
+    const probeMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
     const probeMesh = new THREE.Mesh(probeGeo, probeMat);
 
-    // Glowing aura
-    const auraGeo = new THREE.SphereGeometry(0.75, 16, 16);
+    const auraGeo = new THREE.SphereGeometry(probeRadius * 1.8, 16, 16);
     const auraMat = new THREE.MeshBasicMaterial({
       color: 0x60a5fa,
       transparent: true,
       opacity: 0.75,
       blending: THREE.AdditiveBlending,
     });
-    const glowMesh = new THREE.Mesh(auraGeo, auraMat);
-    probeMesh.add(glowMesh);
-
+    probeMesh.add(new THREE.Mesh(auraGeo, auraMat));
     probeMesh.position.set(x, y, z);
-    sceneRef.current.add(probeMesh);
 
-    const probeId = probeIdCounterRef.current++;
-    probesRef.current.push({
+    sceneRef.current.add(probeMesh);
+    probeMeshesRef.current.set(probeId, probeMesh);
+
+    rigidBodiesRef.current.push({
       id: probeId,
-      mesh: probeMesh,
-      glowMesh,
+      type: 'probe',
       x,
       y,
       z,
       vx,
       vy,
       vz,
-      active: true,
-      birthTime: performance.now(),
+      ax: 0,
+      ay: 0,
+      az: 0,
+      mass: probeMass,
+      radius: probeRadius,
+      restitution: configRef.current.restitution,
+      inertia: 0.4 * probeMass * probeRadius * probeRadius,
+      rotX: 0,
+      rotY: 0,
+      rotZ: 0,
+      angVx: (Math.random() - 0.5) * 2.0,
+      angVy: (Math.random() - 0.5) * 2.0,
+      angVz: (Math.random() - 0.5) * 2.0,
+      isAlive: true,
+      spaghettifying: false,
+      generation: 0,
     });
 
     spaceAudio.playProbeLaunch();
   }, [launchProbeTrigger]);
+
+  // Spawn Massive Rogue Planetoid
+  useEffect(() => {
+    if (spawnPlanetoidTrigger === 0 || !sceneRef.current) return;
+
+    // Spawn rogue planetoid at outer perimeter with high momentum barreling through belt
+    const spawnAngle = (Math.PI * 0.7) + (Math.random() - 0.5) * 0.5;
+    const spawnRadius = 64.0;
+    const x = Math.cos(spawnAngle) * spawnRadius;
+    const y = 8.5;
+    const z = Math.sin(spawnAngle) * spawnRadius;
+
+    // Aimed directly through the middle of the asteroid belt towards the black hole
+    const targetX = 0;
+    const targetY = 0;
+    const targetZ = 0;
+    const toTarget = new THREE.Vector3(targetX - x, targetY - y, targetZ - z).normalize();
+    const speed = 14.5;
+
+    const planetoidId = bodyIdCounterRef.current++;
+    const planetoidRadius = 3.2;
+    const planetoidMass = 320.0; // 100x mass of typical asteroid
+
+    if (roguePlanetoidMeshRef.current) {
+      sceneRef.current.remove(roguePlanetoidMeshRef.current);
+    }
+
+    const { map, emissiveMap } = createPlanetoidTextures();
+    const planetoidGeo = new THREE.SphereGeometry(planetoidRadius, 48, 48);
+    const planetoidMat = new THREE.MeshStandardMaterial({
+      map,
+      emissiveMap,
+      emissive: new THREE.Color(0xff4500),
+      emissiveIntensity: 2.2,
+      roughness: 0.78,
+      metalness: 0.22,
+    });
+    const planetoidMesh = new THREE.Mesh(planetoidGeo, planetoidMat);
+    planetoidMesh.position.set(x, y, z);
+
+    // Glowing atmospheric rim
+    const atmGeo = new THREE.SphereGeometry(planetoidRadius * 1.15, 32, 32);
+    const atmMat = new THREE.MeshBasicMaterial({
+      color: 0xf97316,
+      transparent: true,
+      opacity: 0.35,
+      blending: THREE.AdditiveBlending,
+      side: THREE.BackSide,
+    });
+    planetoidMesh.add(new THREE.Mesh(atmGeo, atmMat));
+
+    sceneRef.current.add(planetoidMesh);
+    roguePlanetoidMeshRef.current = planetoidMesh;
+
+    // Remove any previous rogue planetoid body from rigidBodiesRef
+    rigidBodiesRef.current = rigidBodiesRef.current.filter((b) => b.type !== 'planetoid');
+
+    rigidBodiesRef.current.push({
+      id: planetoidId,
+      type: 'planetoid',
+      x,
+      y,
+      z,
+      vx: toTarget.x * speed,
+      vy: toTarget.y * speed,
+      vz: toTarget.z * speed,
+      ax: 0,
+      ay: 0,
+      az: 0,
+      mass: planetoidMass,
+      radius: planetoidRadius,
+      restitution: 0.45,
+      inertia: 0.4 * planetoidMass * planetoidRadius * planetoidRadius,
+      rotX: 0,
+      rotY: 0,
+      rotZ: 0,
+      angVx: (Math.random() - 0.5) * 1.2,
+      angVy: (Math.random() - 0.5) * 1.2,
+      angVz: (Math.random() - 0.5) * 1.2,
+      isAlive: true,
+      spaghettifying: false,
+      generation: 0,
+    });
+
+    spaceAudio.playPlanetoidRoar();
+  }, [spawnPlanetoidTrigger]);
 
   // Respawn Asteroid Belt trigger
   useEffect(() => {
     if (respawnBeltTrigger === 0 || !asteroidMeshRef.current) return;
 
     const mesh = asteroidMeshRef.current;
-    const bodies = asteroidBodiesRef.current;
     const beltRadius = configRef.current.asteroidBeltRadius;
     const beltWidth = configRef.current.asteroidBeltWidth;
+    const count = configRef.current.asteroidCount;
 
-    for (let i = 0; i < MAX_ASTEROIDS; i++) {
+    // Remove old asteroids and debris, keeping active probes and planetoids
+    const nonAsteroids = rigidBodiesRef.current.filter((b) => b.type === 'probe' || b.type === 'planetoid');
+    const newAsteroids: RigidBody[] = [];
+
+    for (let i = 0; i < count; i++) {
       const r = (beltRadius - beltWidth / 2) + Math.random() * beltWidth;
       const angle = Math.random() * Math.PI * 2;
       const x = Math.cos(angle) * r;
@@ -193,33 +355,55 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
 
       const [vx, vy, vz] = computeStableOrbitalVelocity(x, y, z, BASE_BLACK_HOLE_GM, (Math.random() - 0.5) * 0.05);
       const scale = 0.35 + Math.random() * 0.85;
+      const radius = scale * 0.95;
+      const mass = Math.pow(scale, 3) * 2.5;
 
-      bodies[i] = {
-        id: i + 1,
+      const body: RigidBody = {
+        id: bodyIdCounterRef.current++,
+        type: 'asteroid',
         x,
         y,
         z,
         vx,
         vy,
         vz,
-        scale,
+        ax: 0,
+        ay: 0,
+        az: 0,
+        mass,
+        radius,
+        restitution: configRef.current.restitution,
+        inertia: 0.4 * mass * radius * radius,
         rotX: Math.random() * Math.PI,
         rotY: Math.random() * Math.PI,
         rotZ: Math.random() * Math.PI,
-        spinSpeedX: (Math.random() - 0.5) * 1.5,
-        spinSpeedY: (Math.random() - 0.5) * 1.5,
-        consumed: false,
+        angVx: (Math.random() - 0.5) * 1.5,
+        angVy: (Math.random() - 0.5) * 1.5,
+        angVz: (Math.random() - 0.5) * 1.5,
+        isAlive: true,
+        spaghettifying: false,
+        generation: 0,
       };
+      newAsteroids.push(body);
 
       _scratchPos.set(x, y, z);
-      _scratchEuler.set(bodies[i].rotX, bodies[i].rotY, bodies[i].rotZ);
+      _scratchEuler.set(body.rotX, body.rotY, body.rotZ);
       _scratchQuat.setFromEuler(_scratchEuler);
       _scratchVec3.set(scale, scale, scale);
       _scratchMatrix.compose(_scratchPos, _scratchQuat, _scratchVec3);
       mesh.setMatrixAt(i, _scratchMatrix);
     }
 
+    // Hide remaining instances
+    for (let i = count; i < MAX_RIGID_BODIES; i++) {
+      _scratchPos.set(0, -99999, 0);
+      _scratchMatrix.makeTranslation(0, -99999, 0);
+      mesh.setMatrixAt(i, _scratchMatrix);
+    }
+
+    mesh.count = count;
     mesh.instanceMatrix.needsUpdate = true;
+    rigidBodiesRef.current = [...newAsteroids, ...nonAsteroids];
   }, [respawnBeltTrigger]);
 
   // Handle camera presets
@@ -253,17 +437,185 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     onCameraPresetHandled();
   }, [cameraPreset, onCameraPresetHandled]);
 
+  // Synchronize Celestial Bodies with 3D Scene
+  const syncCelestialBodies = (scene: THREE.Scene, bodiesList: CelestialBodyDefinition[]) => {
+    const currentMap = celestialMeshesRef.current;
+    const incomingIds = new Set(bodiesList.map((b) => b.id));
+
+    // Remove obsolete bodies
+    currentMap.forEach((cData, id) => {
+      if (!incomingIds.has(id)) {
+        scene.remove(cData.group);
+        if (cData.orbitLine) scene.remove(cData.orbitLine);
+        cData.planetMesh.geometry.dispose();
+        if (Array.isArray(cData.planetMesh.material)) {
+          cData.planetMesh.material.forEach((m) => m.dispose());
+        } else {
+          cData.planetMesh.material.dispose();
+        }
+        if (cData.ringMesh) {
+          cData.ringMesh.geometry.dispose();
+          (cData.ringMesh.material as THREE.Material).dispose();
+        }
+        if (cData.atmosphereMesh) {
+          cData.atmosphereMesh.geometry.dispose();
+          (cData.atmosphereMesh.material as THREE.Material).dispose();
+        }
+        cData.moons.forEach((m) => {
+          m.mesh.geometry.dispose();
+          (m.mesh.material as THREE.Material).dispose();
+        });
+        currentMap.delete(id);
+      }
+    });
+
+    // Add newly configured bodies
+    bodiesList.forEach((body) => {
+      if (currentMap.has(body.id)) return;
+
+      const group = new THREE.Group();
+      const initialAngle = body.orbitalAngle ?? (Math.random() * Math.PI * 2);
+      const [initX, initY, initZ] = calculateCelestialOrbitalPosition(
+        body.orbitalRadius,
+        initialAngle,
+        body.eccentricity,
+        body.orbitalInclination
+      );
+
+      const [initVx, initVy, initVz] = calculateCelestialOrbitalVelocity(
+        body.orbitalRadius,
+        initialAngle,
+        BASE_BLACK_HOLE_GM,
+        body.orbitalSpeedMultiplier,
+        body.eccentricity,
+        body.orbitalInclination
+      );
+
+      // Planet Mesh
+      const planetGeo = body.style === 'rocky_asteroid'
+        ? createAsteroidGeometry(body.radius, 2)
+        : new THREE.SphereGeometry(body.radius, 40, 40);
+
+      const planetTexture = createCelestialTexture(body.style, body.color);
+      const planetMat = new THREE.MeshStandardMaterial({
+        map: planetTexture,
+        roughness: 0.75,
+        metalness: 0.16,
+      });
+
+      if (body.style === 'lava') {
+        planetMat.emissive = new THREE.Color(0xff4500);
+        planetMat.emissiveIntensity = 1.6;
+      }
+
+      const planetMesh = new THREE.Mesh(planetGeo, planetMat);
+      group.add(planetMesh);
+
+      // Atmosphere
+      let atmosphereMesh: THREE.Mesh | undefined;
+      if (body.hasAtmosphere) {
+        const atmGeo = new THREE.SphereGeometry(body.radius * 1.14, 32, 32);
+        const atmMat = new THREE.MeshBasicMaterial({
+          color: new THREE.Color(body.atmosphereColor || '#60a5fa'),
+          transparent: true,
+          opacity: 0.38,
+          blending: THREE.AdditiveBlending,
+          side: THREE.BackSide,
+        });
+        atmosphereMesh = new THREE.Mesh(atmGeo, atmMat);
+        group.add(atmosphereMesh);
+      }
+
+      // Rings
+      let ringMesh: THREE.Mesh | undefined;
+      if (body.hasRings) {
+        const inner = body.radius * (body.ringInnerRadius || 1.35);
+        const outer = body.radius * (body.ringOuterRadius || 2.7);
+        const ringGeo = new THREE.RingGeometry(inner, outer, 64);
+        ringGeo.rotateX(Math.PI / 2);
+        const ringTexture = createRingTexture(body.ringColor || '#fbbf24');
+        const ringMat = new THREE.MeshStandardMaterial({
+          map: ringTexture,
+          transparent: true,
+          opacity: 0.92,
+          side: THREE.DoubleSide,
+          roughness: 0.65,
+        });
+        ringMesh = new THREE.Mesh(ringGeo, ringMat);
+        ringMesh.rotation.z = ((body.ringTilt || 22) * Math.PI) / 180;
+        group.add(ringMesh);
+      }
+
+      // Moons
+      const moonsData: { config: MoonConfig; mesh: THREE.Mesh; currentAngle: number }[] = [];
+      body.moons.forEach((mConf, idx) => {
+        const mGeo = new THREE.SphereGeometry(mConf.radius, 20, 20);
+        const mTex = createMoonTexture(mConf.color || '#cbd5e1');
+        const mMat = new THREE.MeshStandardMaterial({ map: mTex, roughness: 0.82 });
+        const mMesh = new THREE.Mesh(mGeo, mMat);
+        const initialMoonAngle = (idx / Math.max(1, body.moons.length)) * Math.PI * 2;
+        const [mx, my, mz] = calculateMoonPosition(0, 0, 0, mConf.orbitalDistance, initialMoonAngle, mConf.orbitalInclination);
+        mMesh.position.set(mx, my, mz);
+        group.add(mMesh);
+
+        moonsData.push({
+          config: mConf,
+          mesh: mMesh,
+          currentAngle: initialMoonAngle,
+        });
+      });
+
+      // Orbit path guide
+      const pathPoints = generateOrbitPathPoints(body.orbitalRadius, body.eccentricity, body.orbitalInclination, 96);
+      const orbitGeo = new THREE.BufferGeometry().setFromPoints(pathPoints.map(p => new THREE.Vector3(p[0], p[1], p[2])));
+      const orbitMat = new THREE.LineBasicMaterial({
+        color: new THREE.Color(body.color).lerp(new THREE.Color(0xffffff), 0.35),
+        transparent: true,
+        opacity: 0.25,
+        blending: THREE.AdditiveBlending,
+      });
+      const orbitLine = new THREE.LineLoop(orbitGeo, orbitMat);
+      scene.add(orbitLine);
+
+      group.position.set(initX, initY, initZ);
+      scene.add(group);
+
+      currentMap.set(body.id, {
+        definition: body,
+        group,
+        planetMesh,
+        atmosphereMesh,
+        ringMesh,
+        orbitLine,
+        moons: moonsData,
+        x: initX,
+        y: initY,
+        z: initZ,
+        vx: initVx,
+        vy: initVy,
+        vz: initVz,
+        isAlive: true,
+      });
+    });
+  };
+
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    syncCelestialBodies(scene, celestialBodies);
+  }, [celestialBodies]);
+
   useEffect(() => {
     const container = mountRef.current;
     if (!container) return;
 
-    // Headless / automation check
     const isHeadless = navigator.webdriver || /HeadlessChrome/i.test(navigator.userAgent);
 
     // 1. Scene, Camera, Renderer
     const scene = new THREE.Scene();
     sceneRef.current = scene;
     scene.fog = new THREE.FogExp2(0x020308, 0.0015);
+    syncCelestialBodies(scene, celestialBodies);
 
     const width = container.clientWidth || window.innerWidth;
     const height = container.clientHeight || window.innerHeight;
@@ -306,11 +658,10 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     keyDirectional.position.set(50, 60, 40);
     scene.add(keyDirectional);
 
-    // 4. Hero Subject: Black Hole Assembly
+    // 4. Black Hole Visual Assembly
     const blackHoleGroup = new THREE.Group();
     scene.add(blackHoleGroup);
 
-    // (A) Event Horizon Sphere
     const eventHorizonGeo = new THREE.SphereGeometry(EVENT_HORIZON_RADIUS, 64, 64);
     const eventHorizonMat = new THREE.MeshBasicMaterial({
       color: 0x000000,
@@ -320,7 +671,6 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     eventHorizonMesh.renderOrder = 10;
     blackHoleGroup.add(eventHorizonMesh);
 
-    // (B) Photon Ring Glow Disk
     const photonRingRadius = EVENT_HORIZON_RADIUS * 1.48;
     const photonRingGeo = new THREE.RingGeometry(EVENT_HORIZON_RADIUS * 1.02, photonRingRadius * 1.3, 96);
     const photonRingMat = new THREE.MeshBasicMaterial({
@@ -335,7 +685,6 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     photonRingMesh.rotation.x = Math.PI / 2;
     blackHoleGroup.add(photonRingMesh);
 
-    // (C) Vertical Einstein Ring Halo
     const haloGeo = new THREE.RingGeometry(EVENT_HORIZON_RADIUS * 1.05, photonRingRadius * 1.35, 96);
     const haloMat = new THREE.MeshBasicMaterial({
       color: 0xffa033,
@@ -348,7 +697,6 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     const haloMesh = new THREE.Mesh(haloGeo, haloMat);
     blackHoleGroup.add(haloMesh);
 
-    // (D) Relativistic Bipolar Jets
     const jetGroup = new THREE.Group();
     blackHoleGroup.add(jetGroup);
 
@@ -371,7 +719,6 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     lowerJet.rotation.x = Math.PI;
     jetGroup.add(lowerJet);
 
-    // (E) Accretion Fluid Gas Disks
     const fluidDiskGeo = new THREE.RingGeometry(ISCO_RADIUS, DISK_OUTER_RADIUS, 96, 12);
     const fluidDiskMat = new THREE.MeshBasicMaterial({
       color: 0xff7700,
@@ -385,7 +732,7 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     fluidDiskMesh.rotation.x = Math.PI / 2;
     blackHoleGroup.add(fluidDiskMesh);
 
-    // 5. Procedural Accretion Disk Particles
+    // 5. Accretion Disk Particles
     const particleTexture = createParticleTexture();
     const particleGeo = new THREE.BufferGeometry();
     const particlePositions = new Float32Array(MAX_PARTICLES * 3);
@@ -417,19 +764,14 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       verticalPhases[i] = vertPhase;
       baseSizes[i] = size;
 
-      const x = Math.cos(theta) * r;
-      const y = Math.sin(vertPhase) * (vertAmp * 0.4);
-      const z = Math.sin(theta) * r;
-
-      particlePositions[i * 3] = x;
-      particlePositions[i * 3 + 1] = y;
-      particlePositions[i * 3 + 2] = z;
+      particlePositions[i * 3] = Math.cos(theta) * r;
+      particlePositions[i * 3 + 1] = Math.sin(vertPhase) * (vertAmp * 0.4);
+      particlePositions[i * 3 + 2] = Math.sin(theta) * r;
 
       const [cr, cg, cb] = getParticleColorByRadius(r, ISCO_RADIUS, DISK_OUTER_RADIUS, activePalette);
       particleColors[i * 3] = cr;
       particleColors[i * 3 + 1] = cg;
       particleColors[i * 3 + 2] = cb;
-
       particleSizes[i] = size;
     }
 
@@ -445,34 +787,34 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       vertexColors: true,
       depthWrite: false,
     });
-
     const particlePoints = new THREE.Points(particleGeo, particleMat);
     scene.add(particlePoints);
 
-    // 6. Newtonian Orbital Asteroid Belt (InstancedMesh)
+    // 6. Rigid Body Instanced Mesh (Asteroids & Debris)
     const { bumpMap, roughnessMap } = createAsteroidTextures();
     const asteroidGeo = createAsteroidGeometry(1.0, 1);
     const asteroidMat = new THREE.MeshStandardMaterial({
       color: 0x94a3b8,
       roughness: 0.85,
       metalness: 0.12,
-      bumpMap: bumpMap,
+      bumpMap,
       bumpScale: 0.08,
-      roughnessMap: roughnessMap,
+      roughnessMap,
       flatShading: true,
     });
 
-    const asteroidMesh = new THREE.InstancedMesh(asteroidGeo, asteroidMat, MAX_ASTEROIDS);
+    const asteroidMesh = new THREE.InstancedMesh(asteroidGeo, asteroidMat, MAX_RIGID_BODIES);
     asteroidMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     scene.add(asteroidMesh);
     asteroidMeshRef.current = asteroidMesh;
 
-    // Initialize Asteroid Bodies with 3D positions and stable orbital velocity vectors
-    const asteroidBodies: AsteroidBody[] = [];
+    // Seed Initial Asteroid Rigid Bodies
     const initialBeltRadius = configRef.current.asteroidBeltRadius;
     const initialBeltWidth = configRef.current.asteroidBeltWidth;
+    const asteroidCount = configRef.current.asteroidCount;
+    const initialBodies: RigidBody[] = [];
 
-    for (let i = 0; i < MAX_ASTEROIDS; i++) {
+    for (let i = 0; i < asteroidCount; i++) {
       const r = (initialBeltRadius - initialBeltWidth / 2) + Math.random() * initialBeltWidth;
       const angle = Math.random() * Math.PI * 2;
       const x = Math.cos(angle) * r;
@@ -481,44 +823,84 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
 
       const [vx, vy, vz] = computeStableOrbitalVelocity(x, y, z, BASE_BLACK_HOLE_GM, (Math.random() - 0.5) * 0.05);
       const scale = 0.35 + Math.random() * 0.85;
+      const radius = scale * 0.95;
+      const mass = Math.pow(scale, 3) * 2.5;
 
-      asteroidBodies.push({
-        id: i + 1,
+      initialBodies.push({
+        id: bodyIdCounterRef.current++,
+        type: 'asteroid',
         x,
         y,
         z,
         vx,
         vy,
         vz,
-        scale,
+        ax: 0,
+        ay: 0,
+        az: 0,
+        mass,
+        radius,
+        restitution: configRef.current.restitution,
+        inertia: 0.4 * mass * radius * radius,
         rotX: Math.random() * Math.PI,
         rotY: Math.random() * Math.PI,
         rotZ: Math.random() * Math.PI,
-        spinSpeedX: (Math.random() - 0.5) * 1.5,
-        spinSpeedY: (Math.random() - 0.5) * 1.5,
-        consumed: false,
+        angVx: (Math.random() - 0.5) * 1.5,
+        angVy: (Math.random() - 0.5) * 1.5,
+        angVz: (Math.random() - 0.5) * 1.5,
+        isAlive: true,
+        spaghettifying: false,
+        generation: 0,
       });
 
       _scratchPos.set(x, y, z);
-      _scratchEuler.set(asteroidBodies[i].rotX, asteroidBodies[i].rotY, asteroidBodies[i].rotZ);
+      _scratchEuler.set(initialBodies[i].rotX, initialBodies[i].rotY, initialBodies[i].rotZ);
       _scratchQuat.setFromEuler(_scratchEuler);
       _scratchVec3.set(scale, scale, scale);
-
       _scratchMatrix.compose(_scratchPos, _scratchQuat, _scratchVec3);
       asteroidMesh.setMatrixAt(i, _scratchMatrix);
 
-      // Random tint variation (slate grey, iron rust, chondrite dark)
       const tintShade = 0.7 + Math.random() * 0.5;
       const rust = Math.random() > 0.6 ? 0.15 : 0;
       _scratchColor.setRGB(tintShade * (0.8 + rust), tintShade * 0.8, tintShade * 0.75);
       asteroidMesh.setColorAt(i, _scratchColor);
     }
+
+    for (let i = asteroidCount; i < MAX_RIGID_BODIES; i++) {
+      _scratchPos.set(0, -99999, 0);
+      _scratchMatrix.makeTranslation(0, -99999, 0);
+      asteroidMesh.setMatrixAt(i, _scratchMatrix);
+    }
+
     asteroidMesh.instanceMatrix.needsUpdate = true;
     if (asteroidMesh.instanceColor) asteroidMesh.instanceColor.needsUpdate = true;
-    asteroidMesh.count = configRef.current.asteroidCount;
-    asteroidBodiesRef.current = asteroidBodies;
+    asteroidMesh.count = asteroidCount;
+    rigidBodiesRef.current = initialBodies;
 
-    // 7. Dynamic Starfield & Nebula Background
+    // 7. Visual Impact Sparks System (THREE.Points)
+    const sparkGeo = new THREE.BufferGeometry();
+    sparkGeo.setAttribute('position', new THREE.BufferAttribute(sparksPosRef.current, 3));
+    const sparkColors = new Float32Array(MAX_SPARKS * 3);
+    for (let i = 0; i < MAX_SPARKS; i++) {
+      sparkColors[i * 3] = 1.0;
+      sparkColors[i * 3 + 1] = 0.85;
+      sparkColors[i * 3 + 2] = 0.3;
+    }
+    sparkGeo.setAttribute('color', new THREE.BufferAttribute(sparkColors, 3));
+
+    const sparkMat = new THREE.PointsMaterial({
+      size: 1.4,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.95,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const sparksPoints = new THREE.Points(sparkGeo, sparkMat);
+    scene.add(sparksPoints);
+    sparksPointsRef.current = sparksPoints;
+
+    // 8. Starfield Background
     const starCount = 5500;
     const starGeo = new THREE.BufferGeometry();
     const starPos = new Float32Array(starCount * 3);
@@ -531,13 +913,9 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       const phi = Math.acos(2.0 * v - 1.0);
       const dist = 750 + Math.random() * 850;
 
-      const x = dist * Math.sin(phi) * Math.cos(theta);
-      const y = dist * Math.sin(phi) * Math.sin(theta);
-      const z = dist * Math.cos(phi);
-
-      starPos[i * 3] = x;
-      starPos[i * 3 + 1] = y;
-      starPos[i * 3 + 2] = z;
+      starPos[i * 3] = dist * Math.sin(phi) * Math.cos(theta);
+      starPos[i * 3 + 1] = dist * Math.sin(phi) * Math.sin(theta);
+      starPos[i * 3 + 2] = dist * Math.cos(phi);
 
       const starType = Math.random();
       if (starType < 0.25) {
@@ -568,10 +946,9 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       transparent: true,
       opacity: 0.85,
     });
-    const starField = new THREE.Points(starGeo, starMat);
-    scene.add(starField);
+    scene.add(new THREE.Points(starGeo, starMat));
 
-    // Deep cosmic dust clouds (Nebula billboards)
+    // Nebulae
     const nebulaTex = createNebulaTexture();
     const nebulaGroup = new THREE.Group();
     scene.add(nebulaGroup);
@@ -586,7 +963,6 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
         depthWrite: false,
       });
       const nebulaMesh = new THREE.Mesh(nebulaGeo, nebulaMat);
-      
       const phi = Math.random() * Math.PI;
       const theta = Math.random() * Math.PI * 2;
       const dist = 650;
@@ -600,15 +976,14 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       nebulaGroup.add(nebulaMesh);
     }
 
-    // 8. Post-Processing Pipeline
+    // 9. Post-Processing Pipeline
     let composer: EffectComposer | null = null;
     let bloomPass: UnrealBloomPass | null = null;
     let fxaaPass: ShaderPass | null = null;
 
     if (!isHeadless) {
       composer = new EffectComposer(renderer);
-      const renderPass = new RenderPass(scene, camera);
-      composer.addPass(renderPass);
+      composer.addPass(new RenderPass(scene, camera));
 
       bloomPass = new UnrealBloomPass(
         new THREE.Vector2(width, height),
@@ -619,15 +994,11 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       composer.addPass(bloomPass);
 
       fxaaPass = new ShaderPass(FXAAShader);
-      const pixelRatio = renderer.getPixelRatio();
-      fxaaPass.material.uniforms['resolution'].value.set(
-        1 / (width * pixelRatio),
-        1 / (height * pixelRatio)
-      );
+      const pr = renderer.getPixelRatio();
+      fxaaPass.material.uniforms['resolution'].value.set(1 / (width * pr), 1 / (height * pr));
       composer.addPass(fxaaPass);
     }
 
-    // 9. Window Resize Handling
     const handleResize = () => {
       if (!container) return;
       const w = container.clientWidth || window.innerWidth;
@@ -635,14 +1006,9 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
 
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-
       renderer.setSize(w, h);
-      if (composer) {
-        composer.setSize(w, h);
-      }
-      if (bloomPass) {
-        bloomPass.resolution.set(w, h);
-      }
+      composer?.setSize(w, h);
+      bloomPass?.resolution.set(w, h);
       if (fxaaPass) {
         const pr = renderer.getPixelRatio();
         fxaaPass.material.uniforms['resolution'].value.set(1 / (w * pr), 1 / (h * pr));
@@ -650,10 +1016,9 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
     };
     window.addEventListener('resize', handleResize);
 
-    // Pre-warm shaders
     renderer.compile(scene, camera);
 
-    // 10. Real-time Newtonian Physics & Render Loop
+    // 10. True 3D Rigid-Body Physics & Render Loop
     let animationFrameId: number;
     let lastTime = performance.now();
     let frameCount = 0;
@@ -664,55 +1029,69 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
 
       const deltaMs = currentTime - lastTime;
       lastTime = currentTime;
-      const dt = Math.min(deltaMs / 1000, 0.08);
+      const rawDt = Math.min(deltaMs / 1000, 0.08);
 
-      // FPS Telemetry calculation (throttled to 4 Hz)
+      const cfg = configRef.current;
+      const timeScale = cfg.isPaused ? 0 : cfg.timeScale;
+      const dt = rawDt * timeScale;
+
+      // FPS Telemetry
       frameCount++;
       if (currentTime - lastFpsUpdate >= 250) {
         const calculatedFps = Math.round((frameCount * 1000) / (currentTime - lastFpsUpdate));
-        onTelemetryUpdate(calculatedFps, configRef.current.particleCount);
+        const aliveBodies = rigidBodiesRef.current.filter((b) => b.isAlive).length;
+        onTelemetryUpdate(calculatedFps, cfg.particleCount, aliveBodies, totalCollisionsCounterRef.current);
         frameCount = 0;
         lastFpsUpdate = currentTime;
       }
 
-      const cfg = configRef.current;
-      const timeScale = cfg.isPaused ? 0 : 1;
-
-      // Update Audio Engine Parameters
+      // Audio engine update
       if (cfg.audioEnabled) {
         spaceAudio.updateParameters(cfg.rotationSpeed);
       }
 
-      // Camera Smooth Transition Damping
+      // Camera Damping
       if (isTransitioningCameraRef.current) {
-        camera.position.x = THREE.MathUtils.damp(camera.position.x, _camPosTarget.x, 3.5, dt);
-        camera.position.y = THREE.MathUtils.damp(camera.position.y, _camPosTarget.y, 3.5, dt);
-        camera.position.z = THREE.MathUtils.damp(camera.position.z, _camPosTarget.z, 3.5, dt);
+        camera.position.x = THREE.MathUtils.damp(camera.position.x, _camPosTarget.x, 3.5, rawDt);
+        camera.position.y = THREE.MathUtils.damp(camera.position.y, _camPosTarget.y, 3.5, rawDt);
+        camera.position.z = THREE.MathUtils.damp(camera.position.z, _camPosTarget.z, 3.5, rawDt);
 
-        controls.target.x = THREE.MathUtils.damp(controls.target.x, _camLookTarget.x, 3.5, dt);
-        controls.target.y = THREE.MathUtils.damp(controls.target.y, _camLookTarget.y, 3.5, dt);
-        controls.target.z = THREE.MathUtils.damp(controls.target.z, _camLookTarget.z, 3.5, dt);
+        controls.target.x = THREE.MathUtils.damp(controls.target.x, _camLookTarget.x, 3.5, rawDt);
+        controls.target.y = THREE.MathUtils.damp(controls.target.y, _camLookTarget.y, 3.5, rawDt);
+        controls.target.z = THREE.MathUtils.damp(controls.target.z, _camLookTarget.z, 3.5, rawDt);
 
         if (camera.position.distanceTo(_camPosTarget) < 0.25) {
           isTransitioningCameraRef.current = false;
         }
       }
 
-      // Auto-rotate camera if enabled
-      if (cfg.autoRotateCamera && !isTransitioningCameraRef.current) {
+      if (cfg.autoRotateCamera && !isTransitioningCameraRef.current && !trackedBodyIdRef.current) {
         controls.autoRotate = true;
         controls.autoRotateSpeed = 0.75 * cfg.rotationSpeed;
       } else {
         controls.autoRotate = false;
       }
 
+      // Smooth Camera Tracking for Celestial Bodies
+      if (trackedBodyIdRef.current && celestialMeshesRef.current.has(trackedBodyIdRef.current)) {
+        const tracked = celestialMeshesRef.current.get(trackedBodyIdRef.current)!;
+        if (tracked.isAlive) {
+          controls.target.x = THREE.MathUtils.damp(controls.target.x, tracked.x, 5.0, rawDt);
+          controls.target.y = THREE.MathUtils.damp(controls.target.y, tracked.y, 5.0, rawDt);
+          controls.target.z = THREE.MathUtils.damp(controls.target.z, tracked.z, 5.0, rawDt);
+
+          const followDist = Math.max(9.0, tracked.definition.radius * 4.5);
+          camera.position.x = THREE.MathUtils.damp(camera.position.x, tracked.x + followDist * 0.8, 3.2, rawDt);
+          camera.position.y = THREE.MathUtils.damp(camera.position.y, tracked.y + followDist * 0.45, 3.2, rawDt);
+          camera.position.z = THREE.MathUtils.damp(camera.position.z, tracked.z + followDist, 3.2, rawDt);
+        }
+      }
+
       controls.update();
 
-      // Camera azimuth angle for Doppler beaming
+      // Camera direction for Doppler beaming
       _scratchVec3.copy(camera.position).sub(controls.target);
       const cameraAzimuth = Math.atan2(_scratchVec3.z, _scratchVec3.x);
-
-      // Rotate Einstein Ring Halo to always face the camera
       haloMesh.lookAt(camera.position);
 
       // Color Palette updates
@@ -723,33 +1102,25 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       jetConeMat.color.set(currentPalette.jetColor);
       fluidDiskMat.color.set(currentPalette.midDisk);
 
-      // Relativistic Jets Visibility
       jetGroup.visible = cfg.relativisticJets;
-      if (cfg.relativisticJets) {
-        upperJet.rotation.y += dt * 1.5 * cfg.rotationSpeed * timeScale;
-        lowerJet.rotation.y += dt * 1.5 * cfg.rotationSpeed * timeScale;
+      if (cfg.relativisticJets && timeScale > 0) {
+        upperJet.rotation.y += dt * 1.5 * cfg.rotationSpeed;
+        lowerJet.rotation.y += dt * 1.5 * cfg.rotationSpeed;
       }
 
-      // Accretion disk fluid mesh rotation
-      fluidDiskMesh.rotation.z += dt * 0.15 * cfg.rotationSpeed * timeScale;
+      if (timeScale > 0) {
+        fluidDiskMesh.rotation.z += dt * 0.15 * cfg.rotationSpeed;
+      }
 
-      // Update Accretion Particles
+      // Accretion Disk Particles Update
       const activeCount = Math.min(cfg.particleCount, MAX_PARTICLES);
-      const posArray = particlePositions;
-      const colArray = particleColors;
-      const sizeArray = particleSizes;
-
       for (let i = 0; i < activeCount; i++) {
         if (timeScale > 0) {
-          const omega = speeds[i] * cfg.rotationSpeed;
-          angles[i] += omega * dt;
-
+          angles[i] += speeds[i] * cfg.rotationSpeed * dt;
           if (cfg.gravityPull > 0) {
-            const drift = computeInwardDrift(radii[i], EVENT_HORIZON_RADIUS, cfg.gravityPull, dt);
-            radii[i] -= drift;
-
+            radii[i] -= computeInwardDrift(radii[i], EVENT_HORIZON_RADIUS, cfg.gravityPull, dt);
             if (radii[i] <= EVENT_HORIZON_RADIUS + 0.1) {
-              radii[i] = DISK_OUTER_RADIUS - (Math.random() * 2.5);
+              radii[i] = DISK_OUTER_RADIUS - Math.random() * 2.5;
               speeds[i] = calculateKeplerianAngularVelocity(radii[i]);
             } else {
               speeds[i] = calculateKeplerianAngularVelocity(radii[i]);
@@ -761,22 +1132,17 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
         const theta = angles[i];
         const vertY = Math.sin(verticalPhases[i] + currentTime * 0.0018) * (verticalAmps[i] * 0.5);
 
-        posArray[i * 3] = Math.cos(theta) * r;
-        posArray[i * 3 + 1] = vertY;
-        posArray[i * 3 + 2] = Math.sin(theta) * r;
+        particlePositions[i * 3] = Math.cos(theta) * r;
+        particlePositions[i * 3 + 1] = vertY;
+        particlePositions[i * 3 + 2] = Math.sin(theta) * r;
 
         const [cr, cg, cb] = getParticleColorByRadius(r, ISCO_RADIUS, DISK_OUTER_RADIUS, currentPalette);
+        const dopplerFactor = cfg.dopplerBeaming ? computeDopplerBeamingFactor(theta, cameraAzimuth, 0.42) : 1.0;
 
-        let dopplerFactor = 1.0;
-        if (cfg.dopplerBeaming) {
-          dopplerFactor = computeDopplerBeamingFactor(theta, cameraAzimuth, 0.42);
-        }
-
-        colArray[i * 3] = Math.min(cr * dopplerFactor, 1.0);
-        colArray[i * 3 + 1] = Math.min(cg * dopplerFactor, 1.0);
-        colArray[i * 3 + 2] = Math.min(cb * dopplerFactor, 1.0);
-
-        sizeArray[i] = baseSizes[i] * (0.8 + dopplerFactor * 0.35);
+        particleColors[i * 3] = Math.min(cr * dopplerFactor, 1.0);
+        particleColors[i * 3 + 1] = Math.min(cg * dopplerFactor, 1.0);
+        particleColors[i * 3 + 2] = Math.min(cb * dopplerFactor, 1.0);
+        particleSizes[i] = baseSizes[i] * (0.8 + dopplerFactor * 0.35);
       }
 
       particleGeo.setDrawRange(0, activeCount);
@@ -784,136 +1150,299 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       particleGeo.attributes.color.needsUpdate = true;
       particleGeo.attributes.size.needsUpdate = true;
 
-      // 11. Newtonian Orbital Physics for Asteroid Belt
-      // Effective gravitational parameter scaled by "Gravity Pull" slider
+      // 11. TRUE 3D RIGID-BODY PHYSICS INTEGRATION
+      const bodies = rigidBodiesRef.current;
       const effectiveGM = BASE_BLACK_HOLE_GM * cfg.gravityPull;
-      const activeAsteroidCount = Math.min(cfg.asteroidCount, MAX_ASTEROIDS);
-      asteroidMesh.count = activeAsteroidCount;
-      const bodies = asteroidBodiesRef.current;
+      const massiveBodies = bodies.filter((b) => b.isAlive && (b.type === 'planetoid' || b.mass > 40.0));
 
-      for (let i = 0; i < activeAsteroidCount; i++) {
-        const ast = bodies[i];
-        if (!ast) continue;
+      if (timeScale > 0 && dt > 0) {
+        // (A) Calculate Gravitational Accelerations (Black Hole + N-Body Massive Perturbations)
+        for (let i = 0; i < bodies.length; i++) {
+          const body = bodies[i];
+          if (!body.isAlive) continue;
 
-        if (ast.consumed) {
-          // Hide consumed asteroid far outside the frustum
-          _scratchPos.set(0, -99999, 0);
-          _scratchMatrix.makeTranslation(0, -99999, 0);
-          asteroidMesh.setMatrixAt(i, _scratchMatrix);
-          continue;
-        }
+          // Black hole central gravity
+          const [axBh, ayBh, azBh] = computeGravitationalAcceleration(body.x, body.y, body.z, effectiveGM);
+          body.ax = axBh;
+          body.ay = ayBh;
+          body.az = azBh;
 
-        if (timeScale > 0) {
-          // Newtonian inverse-square gravitational acceleration: a = - (GM / r^3) * r_vec
-          const [ax, ay, az] = computeGravitationalAcceleration(ast.x, ast.y, ast.z, effectiveGM);
-          
-          ast.vx += ax * dt;
-          ast.vy += ay * dt;
-          ast.vz += az * dt;
-
-          ast.x += ast.vx * dt;
-          ast.y += ast.vy * dt;
-          ast.z += ast.vz * dt;
-
-          ast.rotX += ast.spinSpeedX * dt;
-          ast.rotY += ast.spinSpeedY * dt;
-        }
-
-        const currentDist = Math.sqrt(ast.x * ast.x + ast.y * ast.y + ast.z * ast.z);
-
-        // Check Event Horizon Crossing
-        if (currentDist <= EVENT_HORIZON_RADIUS) {
-          ast.consumed = true;
-          if (onAsteroidConsumed) {
-            onAsteroidConsumed(ast.id, currentDist);
+          // Local N-body gravitational perturbations from massive planetoids
+          if (cfg.gravitationalPerturbations && massiveBodies.length > 0 && body.type !== 'planetoid') {
+            const [pax, pay, paz] = computeNBodyPerturbations(body, massiveBodies, 3.2);
+            body.ax += pax;
+            body.ay += pay;
+            body.az += paz;
           }
-          _scratchPos.set(0, -99999, 0);
-          _scratchMatrix.makeTranslation(0, -99999, 0);
-          asteroidMesh.setMatrixAt(i, _scratchMatrix);
-          continue;
+
+          // Velocity Verlet integration step
+          integrateRigidBodyVerlet(body, dt);
         }
 
-        // Tidal spaghettification effect when approaching event horizon (r <= 6.5 AU)
-        let sx = ast.scale;
-        let sy = ast.scale;
-        let sz = ast.scale;
-
-        const isSpaghettifying = currentDist <= (EVENT_HORIZON_RADIUS * 2.1);
-        if (isSpaghettifying) {
-          const { stretchZ, squashXY } = computeSpaghettificationScale(currentDist, EVENT_HORIZON_RADIUS);
-          sx = ast.scale * squashXY;
-          sy = ast.scale * squashXY;
-          sz = ast.scale * stretchZ;
+        // (B) 3D Spatial Hash Broadphase & Rigid-Body Impulse Collisions
+        const grid = spatialGridRef.current;
+        grid.clear();
+        for (let i = 0; i < bodies.length; i++) {
+          const b = bodies[i];
+          if (b.isAlive) {
+            grid.insert(i, b.x, b.y, b.z);
+          }
         }
 
-        _scratchPos.set(ast.x, ast.y, ast.z);
-        _scratchVec3.set(sx, sy, sz);
+        const newDebrisChunks: RigidBody[] = [];
 
-        if (isSpaghettifying) {
-          // Align longitudinal stretching along radial vector toward singularity
-          _scratchTarget.set(0, 0, 0);
-          _scratchMatrix.lookAt(_scratchPos, _scratchTarget, THREE.Object3D.DEFAULT_UP);
-          _scratchMatrix.scale(_scratchVec3);
-          _scratchMatrix.setPosition(_scratchPos);
-        } else {
-          _scratchEuler.set(ast.rotX, ast.rotY, ast.rotZ);
-          _scratchQuat.setFromEuler(_scratchEuler);
-          _scratchMatrix.compose(_scratchPos, _scratchQuat, _scratchVec3);
+        for (let i = 0; i < bodies.length; i++) {
+          const bodyA = bodies[i];
+          if (!bodyA.isAlive) continue;
+
+          const candidates = grid.queryCandidates(bodyA.x, bodyA.y, bodyA.z, bodyA.radius + 3.5);
+          for (let c = 0; c < candidates.length; c++) {
+            const j = candidates[c];
+            if (j <= i) continue; // Unique pairs
+
+            const bodyB = bodies[j];
+            if (!bodyB.isAlive) continue;
+
+            const res = resolveRigidBodyCollision(bodyA, bodyB, cfg.restitution, cfg.fragmentationThreshold);
+            if (res.collided) {
+              totalCollisionsCounterRef.current++;
+
+              if (res.impactEnergy > 0.5) {
+                // Emit impact sparks
+                emitSparks(res.contactX, res.contactY, res.contactZ, res.normalX, res.normalY, res.normalZ, Math.min(18, 6 + Math.floor(res.impactEnergy * 0.4)));
+                spaceAudio.playImpactCrunch(res.impactEnergy);
+
+                if (onCollisionEvent) {
+                  onCollisionEvent(res.impactEnergy, bodyA.type, bodyB.type);
+                }
+              }
+
+              // High-Energy Fragmentation
+              if (res.shouldShatterA && bodies.length + newDebrisChunks.length < MAX_RIGID_BODIES) {
+                const chunks = shatterRigidBody(bodyA, [res.normalX, res.normalY, res.normalZ], () => bodyIdCounterRef.current++, 4);
+                newDebrisChunks.push(...chunks);
+                if (onFragmentationEvent) {
+                  const dist = Math.sqrt(bodyA.x * bodyA.x + bodyA.y * bodyA.y + bodyA.z * bodyA.z);
+                  onFragmentationEvent(chunks.length, dist);
+                }
+              }
+
+              if (res.shouldShatterB && bodies.length + newDebrisChunks.length < MAX_RIGID_BODIES) {
+                const chunks = shatterRigidBody(bodyB, [-res.normalX, -res.normalY, -res.normalZ], () => bodyIdCounterRef.current++, 4);
+                newDebrisChunks.push(...chunks);
+                if (onFragmentationEvent) {
+                  const dist = Math.sqrt(bodyB.x * bodyB.x + bodyB.y * bodyB.y + bodyB.z * bodyB.z);
+                  onFragmentationEvent(chunks.length, dist);
+                }
+              }
+            }
+          }
         }
 
-        asteroidMesh.setMatrixAt(i, _scratchMatrix);
+        if (newDebrisChunks.length > 0) {
+          rigidBodiesRef.current.push(...newDebrisChunks);
+        }
+
+        // (C) Event Horizon Consumption & Tidal Spaghettification Check
+        for (let i = 0; i < bodies.length; i++) {
+          const body = bodies[i];
+          if (!body.isAlive) continue;
+
+          const dist = Math.sqrt(body.x * body.x + body.y * body.y + body.z * body.z);
+          if (dist <= EVENT_HORIZON_RADIUS) {
+            body.isAlive = false;
+
+            if (body.type === 'asteroid' || body.type === 'debris') {
+              onAsteroidConsumed?.(body.id, dist);
+            } else if (body.type === 'probe') {
+              onProbeConsumed?.(body.id, dist);
+              const mesh = probeMeshesRef.current.get(body.id);
+              if (mesh) {
+                scene.remove(mesh);
+                mesh.geometry.dispose();
+                probeMeshesRef.current.delete(body.id);
+              }
+            } else if (body.type === 'planetoid') {
+              onPlanetoidConsumed?.();
+              if (roguePlanetoidMeshRef.current) {
+                scene.remove(roguePlanetoidMeshRef.current);
+                roguePlanetoidMeshRef.current = null;
+              }
+            }
+          } else {
+            body.spaghettifying = dist <= (EVENT_HORIZON_RADIUS * 2.1);
+          }
+        }
       }
+
+      // (D) Update Visual Meshes from Rigid-Body Positions
+      let asteroidInstanceIdx = 0;
+      for (let i = 0; i < bodies.length; i++) {
+        const body = bodies[i];
+
+        if (body.type === 'asteroid' || body.type === 'debris') {
+          if (asteroidInstanceIdx < MAX_RIGID_BODIES) {
+            if (body.isAlive) {
+              const dist = Math.sqrt(body.x * body.x + body.y * body.y + body.z * body.z);
+              let sx = body.radius;
+              let sy = body.radius;
+              let sz = body.radius;
+
+              if (body.spaghettifying) {
+                const { stretchZ, squashXY } = computeSpaghettificationScale(dist, EVENT_HORIZON_RADIUS);
+                sx = body.radius * squashXY;
+                sy = body.radius * squashXY;
+                sz = body.radius * stretchZ;
+              }
+
+              _scratchPos.set(body.x, body.y, body.z);
+              _scratchVec3.set(sx, sy, sz);
+
+              if (body.spaghettifying) {
+                _scratchTarget.set(0, 0, 0);
+                _scratchMatrix.lookAt(_scratchPos, _scratchTarget, THREE.Object3D.DEFAULT_UP);
+                _scratchMatrix.scale(_scratchVec3);
+                _scratchMatrix.setPosition(_scratchPos);
+              } else {
+                _scratchEuler.set(body.rotX, body.rotY, body.rotZ);
+                _scratchQuat.setFromEuler(_scratchEuler);
+                _scratchMatrix.compose(_scratchPos, _scratchQuat, _scratchVec3);
+              }
+
+              asteroidMesh.setMatrixAt(asteroidInstanceIdx, _scratchMatrix);
+
+              if (body.type === 'debris') {
+                _scratchColor.setRGB(0.95, 0.55, 0.25); // Glowing hot shattered debris facet
+                asteroidMesh.setColorAt(asteroidInstanceIdx, _scratchColor);
+              }
+            } else {
+              _scratchPos.set(0, -99999, 0);
+              _scratchMatrix.makeTranslation(0, -99999, 0);
+              asteroidMesh.setMatrixAt(asteroidInstanceIdx, _scratchMatrix);
+            }
+            asteroidInstanceIdx++;
+          }
+        } else if (body.type === 'probe') {
+          const mesh = probeMeshesRef.current.get(body.id);
+          if (mesh) {
+            if (body.isAlive) {
+              const dist = Math.sqrt(body.x * body.x + body.y * body.y + body.z * body.z);
+              const { stretchZ, squashXY } = computeSpaghettificationScale(dist, EVENT_HORIZON_RADIUS);
+              mesh.position.set(body.x, body.y, body.z);
+              mesh.scale.set(squashXY, squashXY, stretchZ);
+              mesh.lookAt(0, 0, 0);
+            } else {
+              scene.remove(mesh);
+              mesh.geometry.dispose();
+              probeMeshesRef.current.delete(body.id);
+            }
+          }
+        } else if (body.type === 'planetoid') {
+          if (roguePlanetoidMeshRef.current) {
+            if (body.isAlive) {
+              roguePlanetoidMeshRef.current.position.set(body.x, body.y, body.z);
+              roguePlanetoidMeshRef.current.rotation.set(body.rotX, body.rotY, body.rotZ);
+            } else {
+              scene.remove(roguePlanetoidMeshRef.current);
+              roguePlanetoidMeshRef.current = null;
+            }
+          }
+        }
+      }
+
+      // Hide unused instances
+      while (asteroidInstanceIdx < MAX_RIGID_BODIES) {
+        _scratchPos.set(0, -99999, 0);
+        _scratchMatrix.makeTranslation(0, -99999, 0);
+        asteroidMesh.setMatrixAt(asteroidInstanceIdx, _scratchMatrix);
+        asteroidInstanceIdx++;
+      }
+      asteroidMesh.count = Math.min(asteroidInstanceIdx, MAX_RIGID_BODIES);
       asteroidMesh.instanceMatrix.needsUpdate = true;
+      if (asteroidMesh.instanceColor) asteroidMesh.instanceColor.needsUpdate = true;
 
-      // 12. Newtonian Orbital Physics for Launched Probes
-      const probes = probesRef.current;
-      for (let i = probes.length - 1; i >= 0; i--) {
-        const probe = probes[i];
-        if (!probe.active) continue;
+      // 11.B Update Orbiting Celestial Bodies (Planets, Rings, Moons)
+      celestialMeshesRef.current.forEach((cData) => {
+        if (!cData.isAlive) return;
 
-        if (timeScale > 0) {
-          // Gravitational acceleration vector toward origin
-          const [ax, ay, az] = computeGravitationalAcceleration(probe.x, probe.y, probe.z, effectiveGM);
-          
-          probe.vx += ax * dt;
-          probe.vy += ay * dt;
-          probe.vz += az * dt;
+        if (timeScale > 0 && dt > 0) {
+          // Central black hole Newtonian gravity
+          const [axBh, ayBh, azBh] = computeGravitationalAcceleration(cData.x, cData.y, cData.z, effectiveGM);
+          cData.vx += axBh * dt;
+          cData.vy += ayBh * dt;
+          cData.vz += azBh * dt;
 
-          probe.x += probe.vx * dt;
-          probe.y += probe.vy * dt;
-          probe.z += probe.vz * dt;
-        }
+          cData.x += cData.vx * dt;
+          cData.y += cData.vy * dt;
+          cData.z += cData.vz * dt;
 
-        const probeDist = Math.sqrt(probe.x * probe.x + probe.y * probe.y + probe.z * probe.z);
-
-        // Check Event Horizon Crossing
-        if (probeDist <= EVENT_HORIZON_RADIUS) {
-          probe.active = false;
-          scene.remove(probe.mesh);
-          probe.mesh.geometry.dispose();
-          probes.splice(i, 1);
-          if (onProbeConsumed) {
-            onProbeConsumed(probe.id, probeDist);
+          const dist = Math.sqrt(cData.x * cData.x + cData.y * cData.y + cData.z * cData.z);
+          if (dist <= EVENT_HORIZON_RADIUS) {
+            cData.isAlive = false;
+            scene.remove(cData.group);
+            if (cData.orbitLine) scene.remove(cData.orbitLine);
+            emitSparks(cData.x, cData.y, cData.z, 0, 1, 0, 24);
+            spaceAudio.playPlanetoidRoar();
+            onCelestialConsumed?.(cData.definition.id, cData.definition.name);
+            return;
           }
-          continue;
+
+          // Spaghettification near event horizon
+          if (dist <= EVENT_HORIZON_RADIUS * 2.1) {
+            const { stretchZ, squashXY } = computeSpaghettificationScale(dist, EVENT_HORIZON_RADIUS);
+            cData.planetMesh.scale.set(squashXY, squashXY, stretchZ);
+            cData.planetMesh.lookAt(0, 0, 0);
+          } else {
+            cData.planetMesh.scale.set(1, 1, 1);
+          }
         }
 
-        probe.mesh.position.set(probe.x, probe.y, probe.z);
+        // Update group position
+        cData.group.position.set(cData.x, cData.y, cData.z);
+        if (timeScale > 0) {
+          cData.planetMesh.rotation.y += dt * (cData.definition.axialRotationSpeed || 1.0);
+        }
 
-        // Tidal spaghettification stretching
-        const { stretchZ, squashXY } = computeSpaghettificationScale(probeDist, EVENT_HORIZON_RADIUS);
-        probe.mesh.scale.set(squashXY, squashXY, stretchZ);
-        probe.mesh.lookAt(0, 0, 0);
+        // Update orbiting natural satellites (Moons)
+        cData.moons.forEach((m) => {
+          if (timeScale > 0) {
+            m.currentAngle += dt * m.config.orbitalSpeed;
+          }
+          const [mx, my, mz] = calculateMoonPosition(0, 0, 0, m.config.orbitalDistance, m.currentAngle, m.config.orbitalInclination);
+          m.mesh.position.set(mx, my, mz);
+          if (timeScale > 0) {
+            m.mesh.rotation.y += dt * 0.8;
+          }
+        });
+      });
+
+      // 12. Update Impact Sparks
+      const sparkPos = sparksPosRef.current;
+      const sparkVel = sparksVelRef.current;
+      const sparkLife = sparksLifeRef.current;
+
+      for (let s = 0; s < MAX_SPARKS; s++) {
+        if (sparkLife[s] > 0) {
+          sparkLife[s] -= rawDt * 2.8;
+          if (sparkLife[s] <= 0) {
+            sparkLife[s] = 0;
+            sparkPos[s * 3 + 1] = -99999;
+          } else {
+            sparkPos[s * 3] += sparkVel[s * 3] * rawDt;
+            sparkPos[s * 3 + 1] += sparkVel[s * 3 + 1] * rawDt;
+            sparkPos[s * 3 + 2] += sparkVel[s * 3 + 2] * rawDt;
+          }
+        }
       }
+      sparkGeo.attributes.position.needsUpdate = true;
 
-      // Update Bloom pass parameters
+      // 13. Bloom & Render
       if (bloomPass) {
         bloomPass.enabled = cfg.bloomEnabled;
         bloomPass.strength = cfg.bloomStrength;
         bloomPass.threshold = cfg.bloomThreshold;
       }
 
-      // Render Scene
       if (composer && cfg.bloomEnabled && !isHeadless) {
         composer.render();
       } else {
@@ -923,16 +1452,26 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
 
     animationFrameId = requestAnimationFrame(animate);
 
-    // Cleanup on unmount
     return () => {
       cancelAnimationFrame(animationFrameId);
       window.removeEventListener('resize', handleResize);
 
-      probesRef.current.forEach((p) => {
-        scene.remove(p.mesh);
-        p.mesh.geometry.dispose();
+      celestialMeshesRef.current.forEach((cData) => {
+        scene.remove(cData.group);
+        if (cData.orbitLine) scene.remove(cData.orbitLine);
       });
-      probesRef.current = [];
+      celestialMeshesRef.current.clear();
+
+      probeMeshesRef.current.forEach((m) => {
+        scene.remove(m);
+        m.geometry.dispose();
+      });
+      probeMeshesRef.current.clear();
+
+      if (roguePlanetoidMeshRef.current) {
+        scene.remove(roguePlanetoidMeshRef.current);
+        roguePlanetoidMeshRef.current = null;
+      }
 
       eventHorizonGeo.dispose();
       eventHorizonMat.dispose();
@@ -954,6 +1493,8 @@ export const ThreeCanvas: React.FC<ThreeCanvasProps> = ({
       bumpMap.dispose();
       roughnessMap.dispose();
 
+      sparkGeo.dispose();
+      sparkMat.dispose();
       starGeo.dispose();
       starMat.dispose();
       nebulaTex.dispose();
